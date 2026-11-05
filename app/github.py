@@ -1,142 +1,178 @@
+"""Minimal async GitHub REST client (only what this project needs)."""
+from __future__ import annotations
+
+import asyncio
 import base64
-import os
-import shutil
-import subprocess
-import tempfile
-import time
-from pathlib import Path
+import io
+import re
+import zipfile
 from typing import Any
-import requests
+
+import httpx
 
 API_VERSION = "2022-11-28"
+WORKFLOW_FILE = "build.yml"
+
 
 class GitHubError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
 
 class GitHub:
-    def __init__(self, token: str, api_url: str = "https://api.github.com"):
+    def __init__(self, token: str, repo: str, api_url: str = "https://api.github.com",
+                 client: httpx.AsyncClient | None = None):
         if not token:
             raise GitHubError("GITHUB_TOKEN is not configured")
-        self.token = token
+        self.repo = repo
         self.api = api_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": API_VERSION,
-        })
-        self._owner = None
-
-    def request(self, method: str, path: str, **kwargs):
-        response = self.session.request(method, self.api + path, timeout=60, **kwargs)
-        if response.status_code >= 400:
-            try:
-                detail = response.json().get("message", response.text)
-            except Exception:
-                detail = response.text
-            raise GitHubError(f"GitHub API {method} {path} failed ({response.status_code}): {detail}")
-        if response.status_code == 204 or not response.content:
-            return None
-        return response
-
-    @property
-    def owner(self) -> str:
-        if self._owner is None:
-            self._owner = self.request("GET", "/user").json()["login"]
-        return self._owner
-
-    def create_private_repo(self, name: str) -> dict:
-        return self.request("POST", "/user/repos", json={
-            "name": name,
-            "private": True,
-            "auto_init": False,
-            "has_issues": False,
-            "has_projects": False,
-            "has_wiki": False,
-        }).json()
-
-    def push_source(self, repo_url: str, source_dir: Path, build_workflow: str):
-        workflow_dir = source_dir / ".github" / "workflows"
-        workflow_dir.mkdir(parents=True, exist_ok=True)
-        (workflow_dir / "build.yml").write_text(build_workflow, encoding="utf-8")
-
-        subprocess.run(["git", "init", "-b", "main"], cwd=source_dir, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Remote Build Bot"], cwd=source_dir, check=True)
-        subprocess.run(["git", "config", "user.email", "remote-build-bot@users.noreply.github.com"], cwd=source_dir, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=source_dir, check=True)
-        subprocess.run(["git", "commit", "-m", "Temporary remote build source"], cwd=source_dir, check=True)
-
-        askpass_dir = Path(tempfile.mkdtemp(prefix="gh-askpass-"))
-        askpass = askpass_dir / "askpass.sh"
-        askpass.write_text(
-            '#!/bin/sh\ncase "$1" in *Username*) echo "x-access-token";; *) echo "$GITHUB_PUSH_TOKEN";; esac\n',
-            encoding="utf-8",
-        )
-        askpass.chmod(0o700)
-        env = os.environ.copy()
-        env.update({
-            "GIT_ASKPASS": str(askpass),
-            "GIT_TERMINAL_PROMPT": "0",
-            "GITHUB_PUSH_TOKEN": self.token,
-        })
-        try:
-            subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=source_dir, check=True, capture_output=True)
-            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=source_dir, check=True, capture_output=True, env=env, timeout=180)
-        finally:
-            shutil.rmtree(askpass_dir, ignore_errors=True)
-
-    def dispatch(self, owner: str, repo: str, language: str, command: str, artifact_paths: str, timeout_minutes: int):
-        payload = {
-            "ref": "main",
-            "inputs": {
-                "language": language,
-                "build_command": command,
-                "artifact_paths": artifact_paths,
-                "timeout_minutes": str(timeout_minutes),
+        self._client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=15.0),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": "remote-build-mcp",
             },
-        }
-        # GitHub may need a moment to index a newly-pushed workflow file.
-        last_error = None
-        for attempt in range(8):
+            follow_redirects=True,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # -- plumbing ----------------------------------------------------------
+    async def _req(self, method: str, path: str, *, ok: tuple[int, ...] = (200, 201, 202, 204),
+                   retries: int = 3, **kw: Any) -> httpx.Response:
+        last: Exception | None = None
+        for attempt in range(retries + 1):
             try:
-                self.request("POST", f"/repos/{owner}/{repo}/actions/workflows/build.yml/dispatches", json=payload)
-                return
-            except GitHubError as exc:
-                last_error = exc
-                if "(404)" not in str(exc):
-                    raise
-                time.sleep(2)
-        raise last_error
+                resp = await self._client.request(method, f"{self.api}{path}", **kw)
+            except httpx.TransportError as exc:  # network blip
+                last = GitHubError(f"GitHub unreachable: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 8))
+                continue
+            if resp.status_code in ok:
+                return resp
+            if resp.status_code in (502, 503, 504) and attempt < retries:
+                await asyncio.sleep(min(2 ** attempt, 8))
+                continue
+            raise GitHubError(self._explain(method, path, resp), resp.status_code)
+        raise last or GitHubError("GitHub request failed")
 
-    def latest_run(self, owner: str, repo: str) -> dict | None:
-        data = self.request("GET", f"/repos/{owner}/{repo}/actions/runs", params={
-            "event": "workflow_dispatch", "per_page": 5
-        }).json()
-        return data["workflow_runs"][0] if data.get("workflow_runs") else None
+    @staticmethod
+    def _explain(method: str, path: str, resp: httpx.Response) -> str:
+        try:
+            detail = resp.json().get("message", resp.text[:300])
+        except Exception:
+            detail = resp.text[:300]
+        hint = ""
+        if resp.status_code in (403, 429) and resp.headers.get("x-ratelimit-remaining") == "0":
+            hint = f" (rate limited; resets at unix time {resp.headers.get('x-ratelimit-reset')})"
+        elif resp.status_code == 401:
+            hint = " (GITHUB_TOKEN is invalid or expired)"
+        elif resp.status_code == 404:
+            hint = " (repo/workflow not found, or the token cannot access it; did you run `python -m app.cli bootstrap`?)"
+        return f"GitHub API {method} {path} failed ({resp.status_code}): {detail}{hint}"
 
-    def run_logs(self, owner: str, repo: str, run_id: int) -> bytes:
-        response = self.session.get(
-            f"{self.api}/repos/{owner}/{repo}/actions/runs/{run_id}/logs",
-            timeout=120,
-            allow_redirects=True,
-        )
-        if response.status_code >= 400:
-            raise GitHubError(f"Could not download build logs ({response.status_code})")
-        return response.content
+    # -- repo ----------------------------------------------------------------
+    async def repo_info(self) -> dict:
+        return (await self._req("GET", f"/repos/{self.repo}")).json()
 
-    def artifacts(self, owner: str, repo: str, run_id: int) -> list[dict]:
-        data = self.request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts").json()
-        return [a for a in data.get("artifacts", []) if not a.get("expired")]
+    # -- workflow runs -------------------------------------------------------
+    async def dispatch(self, ref: str, inputs: dict[str, str]) -> int | None:
+        """Trigger the build workflow. Returns the run id when GitHub provides it."""
+        path = f"/repos/{self.repo}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+        body = {"ref": ref, "inputs": inputs, "return_run_details": True}
+        try:
+            resp = await self._req("POST", path, json=body)
+        except GitHubError as exc:
+            if exc.status in (400, 422) and "return_run_details" in str(exc):
+                resp = await self._req("POST", path, json={"ref": ref, "inputs": inputs})
+            elif exc.status == 422 and "workflow_dispatch" in str(exc):
+                raise GitHubError(
+                    f"{exc}. The runner repo has no up-to-date workflow; run `python -m app.cli bootstrap`.",
+                    422,
+                ) from exc
+            else:
+                raise
+        if resp.status_code == 200 and resp.content:
+            try:
+                return int(resp.json().get("workflow_run_id"))
+            except (TypeError, ValueError):
+                return None
+        return None
 
-    def download_artifact(self, owner: str, repo: str, artifact_id: int) -> bytes:
-        response = self.session.get(
-            f"{self.api}/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
-            timeout=180,
-            allow_redirects=True,
-        )
-        if response.status_code >= 400:
-            raise GitHubError(f"Could not download artifact ({response.status_code})")
-        return response.content
+    async def find_run(self, job_id: str) -> dict | None:
+        """Find the run whose ``run-name`` equals the job id."""
+        resp = await self._req("GET", f"/repos/{self.repo}/actions/workflows/{WORKFLOW_FILE}/runs",
+                               params={"event": "workflow_dispatch", "per_page": 50})
+        for run in resp.json().get("workflow_runs", []):
+            if run.get("display_title") == job_id or run.get("name") == job_id:
+                return run
+        return None
 
-    def delete_repo(self, owner: str, repo: str):
-        self.request("DELETE", f"/repos/{owner}/{repo}")
+    async def get_run(self, run_id: int) -> dict:
+        return (await self._req("GET", f"/repos/{self.repo}/actions/runs/{run_id}")).json()
+
+    async def cancel_run(self, run_id: int) -> None:
+        await self._req("POST", f"/repos/{self.repo}/actions/runs/{run_id}/cancel", ok=(202, 409))
+
+    async def run_log_text(self, run_id: int, max_chars: int = 400_000) -> str:
+        resp = await self._req("GET", f"/repos/{self.repo}/actions/runs/{run_id}/logs", timeout=120)
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                parts = [zf.read(n).decode("utf-8", "replace") for n in sorted(zf.namelist()) if n.endswith(".txt")]
+        except zipfile.BadZipFile:
+            return ""
+        return "\n".join(parts)[-max_chars:]
+
+    # -- repo contents (used by bootstrap / sync) ------------------------------
+    async def get_file(self, path: str, ref: str) -> tuple[str, bytes] | None:
+        try:
+            data = (await self._req("GET", f"/repos/{self.repo}/contents/{path}", params={"ref": ref})).json()
+        except GitHubError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return data["sha"], base64.b64decode(data.get("content", ""))
+
+    async def put_file(self, path: str, content: bytes, message: str, branch: str, sha: str | None) -> None:
+        body: dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content).decode(),
+            "branch": branch,
+        }
+        if sha:
+            body["sha"] = sha
+        await self._req("PUT", f"/repos/{self.repo}/contents/{path}", json=body)
+
+    # -- secrets ---------------------------------------------------------------
+    async def list_secret_names(self) -> set[str]:
+        data = (await self._req("GET", f"/repos/{self.repo}/actions/secrets", params={"per_page": 100})).json()
+        return {item["name"] for item in data.get("secrets", [])}
+
+    async def set_secret(self, name: str, value: str) -> None:
+        from nacl import encoding, public  # lazy: only bootstrap needs it
+
+        key = (await self._req("GET", f"/repos/{self.repo}/actions/secrets/public-key")).json()
+        box = public.SealedBox(public.PublicKey(key["key"].encode(), encoding.Base64Encoder()))
+        encrypted = base64.b64encode(box.encrypt(value.encode())).decode()
+        await self._req("PUT", f"/repos/{self.repo}/actions/secrets/{name}",
+                        json={"encrypted_value": encrypted, "key_id": key["key_id"]})
+
+
+_RB_RESULT = re.compile(r"RB_RESULT (\{.*\})")
+
+
+def parse_rb_result(log_text: str) -> dict | None:
+    """Recover the (non-sensitive) result line the runner prints in the public log."""
+    import json
+
+    found = None
+    for match in _RB_RESULT.finditer(log_text):
+        try:
+            found = json.loads(match.group(1))
+        except ValueError:
+            continue
+    return found

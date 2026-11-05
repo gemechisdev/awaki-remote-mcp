@@ -1,18 +1,13 @@
 services:
   - type: web
     name: remote-build-mcp
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.service:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    plan: free
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
+      - key: MCP_API_TOKEN
+        generateValue: true
       - key: GITHUB_TOKEN
         sync: false
-      - key: MCP_API_TOKEN
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: GITHUB_REPO
         sync: false
