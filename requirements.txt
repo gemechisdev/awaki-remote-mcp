@@ -1,0 +1,5 @@
+mcp>=1.28,<2
+starlette>=0.40
+uvicorn[standard]>=0.30
+requests>=2.32
+python-multipart>=0.0.9
