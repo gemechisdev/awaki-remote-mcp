@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -18,7 +19,8 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 
 from . import __version__
-from .bootstrap import sync_files
+from .bootstrap import doctor as run_doctor
+from .bootstrap import run_bootstrap
 from .config import Settings
 from .db import Database
 from .github import GitHub, GitHubError
@@ -68,7 +70,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
         gh = GitHub(s.github_token, s.github_repo, s.github_api_url)
     svc = BuildService(s, db, gh)
     sess = SessionService(s, db, gh, svc)
-    sync_state: dict[str, Any] = {"status": "pending"}
+    auto = bool(gh is not None and s.sync_runner_repo)
+    sync_state: dict[str, Any] = {"status": "pending" if auto else "skipped"}
+    svc.setup_state = sync_state
 
     # ------------------------------------------------------------------ MCP
     mcp = FastMCP(
@@ -168,6 +172,21 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return await guard(asyncio.to_thread(svc.delete, job_id))
 
     @mcp.tool()
+    async def service_doctor() -> dict:
+        """Check this service's setup (runner repo, workflow files, secrets, public/private, config). Read-only."""
+        resp = await api_doctor(None)  # type: ignore[arg-type]
+        return json.loads(resp.body)
+
+    @mcp.tool()
+    async def service_setup() -> dict:
+        """Re-run the automatic setup now (push workflow files and secrets to the runner repo). Safe to repeat."""
+        resp = await api_bootstrap(None)  # type: ignore[arg-type]
+        data = json.loads(resp.body)
+        if "error" in data:
+            raise ValueError(data["error"])
+        return data
+
+    @mcp.tool()
     async def get_build_presets() -> dict:
         """Supported languages with their default command, artifact globs and notes."""
         return {name: {"build_command": p.command, "artifact_paths": p.artifacts, "notes": p.description}
@@ -179,9 +198,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
     async def health(request: Request) -> JSONResponse:
         problems = s.problems()
         body: dict[str, Any] = {"ok": True, "service": "remote-build-mcp", "version": __version__,
-                                "configured": not problems}
+                                "configured": not problems, "setup": sync_state.get("status")}
         if request.scope.get("state", {}).get("authed"):
-            body.update(problems=problems, runner_repo_sync=sync_state,
+            body.update(problems=problems, setup_details=sync_state,
                         active_builds=db.active_count((s.max_build_minutes + 20) * 60),
                         active_sessions=db.count_active_sessions())
         return JSONResponse(body)
@@ -266,6 +285,27 @@ def create_app(settings: Settings | None = None) -> Starlette:
         except BuildError as exc:
             return _bad(str(exc))
 
+    async def api_doctor(request: Request) -> JSONResponse:
+        if gh is None:
+            return JSONResponse({"ok": False, "findings": [{"level": "FAIL", "message": m} for m in s.problems()]})
+        try:
+            findings = [{"level": lv, "message": msg} for lv, msg in await run_doctor(gh, s)]
+        except GitHubError as exc:
+            return _bad(str(exc), 502)
+        return JSONResponse({"ok": not any(f["level"] == "FAIL" for f in findings), "setup": sync_state.get("status"),
+                             "findings": findings})
+
+    async def api_bootstrap(request: Request) -> JSONResponse:
+        if gh is None:
+            return _bad("; ".join(s.problems()))
+        try:
+            result = await run_bootstrap(gh, s)
+        except GitHubError as exc:
+            return _bad(str(exc), 502)
+        sync_state.clear()
+        sync_state.update(status="ok" if result["ok"] else "attention", detail=None, **result)
+        return JSONResponse(result)
+
     async def api_presets(request: Request) -> JSONResponse:
         return JSONResponse({n: {"build_command": p.command, "artifact_paths": p.artifacts, "notes": p.description}
                              for n, p in PRESETS.items()})
@@ -320,18 +360,35 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return JSONResponse({"ok": True})
 
     # ------------------------------------------------------------- lifecycle
-    async def background() -> None:
-        if gh is not None and s.sync_runner_repo and not s.problems():
+    async def bootstrap_loop() -> None:
+        """Automatic setup: no shell needed. Runs at every start, retries until it works, re-verifies periodically."""
+        if not auto:
+            return
+        delay = 5
+        while True:
             try:
-                changed = await sync_files(gh, s.github_ref)
-                sync_state.update(status="ok", updated=changed)
-                if changed:
-                    log.info("Updated runner repo files: %s", changed)
-            except Exception as exc:  # never block startup on this
-                sync_state.update(status="failed", error=str(exc)[:300])
-                log.warning("Runner repo sync failed: %s", exc)
-        else:
-            sync_state["status"] = "skipped"
+                result = await run_bootstrap(gh, s)
+                sync_state.clear()
+                sync_state.update(status="ok" if result["ok"] else "attention", detail=None,
+                                  last_run=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **result)
+                if result["files_updated"]:
+                    log.info("Runner repo updated: %s", result["files_updated"])
+                log.info("Automatic setup finished (status=%s, secrets set: %s)", sync_state["status"],
+                         result["secrets_set"])
+                delay = 5
+                await asyncio.sleep(6 * 3600)  # cheap periodic self-heal (e.g. someone deleted a secret)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                blocked = bool(s.problems())
+                sync_state.clear()
+                sync_state.update(status="blocked" if blocked else "failed", detail=str(exc)[:500],
+                                  last_run=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                log.warning("Automatic setup failed (retrying in %ss): %s", delay, exc)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 300)
+
+    async def background() -> None:
         while True:
             try:
                 removed = await asyncio.to_thread(svc.sweep)
@@ -345,6 +402,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/health", health, methods=["GET"]),
         Route("/upload", upload, methods=["POST", "PUT"]),
         Route("/api/presets", api_presets, methods=["GET"]),
+        Route("/api/doctor", api_doctor, methods=["GET"]),
+        Route("/api/bootstrap", api_bootstrap, methods=["POST"]),
         Route("/api/builds", api_submit, methods=["POST"]),
         Route("/api/builds", api_list, methods=["GET"]),
         Route("/api/builds/{job_id}", api_status, methods=["GET"]),
@@ -375,12 +434,14 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
         task = asyncio.create_task(background())
         task2 = asyncio.create_task(session_loop())
+        task3 = asyncio.create_task(bootstrap_loop())
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
             task.cancel()
             task2.cancel()
+            task3.cancel()
             if gh is not None:
                 await gh.aclose()
 

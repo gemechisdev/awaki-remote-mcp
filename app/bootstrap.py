@@ -45,6 +45,30 @@ async def push_secrets(gh: GitHub, s: Settings) -> list[str]:
     return names
 
 
+async def run_bootstrap(gh: GitHub, s: Settings) -> dict:
+    """Everything `python -m app.cli bootstrap` does, callable at startup. Idempotent and cheap:
+    pushes the workflow/runner files if they changed, (re)sets the two repository secrets, then runs the checks."""
+    problems = s.problems()
+    if problems:
+        raise GitHubError("Configuration incomplete: " + "; ".join(problems))
+    try:
+        changed = await sync_files(gh, s.github_ref)
+        secrets = await push_secrets(gh, s)
+    except GitHubError as exc:
+        hint = ""
+        if exc.status in (403, 404):
+            hint = (" The token needs access to ONLY the runner repo with: Actions R/W, Contents R/W, "
+                    "Secrets R/W, Metadata R. Also check GITHUB_REPO and that the repo has a 'main' branch "
+                    "(create it with a README).")
+        elif exc.status in (409, 422):
+            hint = " The repo may be empty: add a README on the 'main' branch first."
+        raise GitHubError(str(exc) + hint, exc.status) from exc
+    findings = await doctor(gh, s)
+    return {"files_updated": changed, "secrets_set": secrets,
+            "findings": [{"level": lv, "message": msg} for lv, msg in findings],
+            "ok": not any(lv == "FAIL" for lv, _ in findings)}
+
+
 async def doctor(gh: GitHub, s: Settings) -> list[tuple[str, str]]:
     """Return (level, message) findings; level is OK / WARN / FAIL."""
     out: list[tuple[str, str]] = []

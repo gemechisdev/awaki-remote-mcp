@@ -85,6 +85,7 @@ class SessionService:
             raise BuildError("Service is not fully configured: " + "; ".join(problems))
         if self.gh is None:
             raise BuildError("GitHub is not configured")
+        self.builds.check_setup()
         language = (language or "generic").strip().lower()
         if language not in PRESETS:
             raise BuildError(f"language must be one of: {', '.join(PRESETS)}")

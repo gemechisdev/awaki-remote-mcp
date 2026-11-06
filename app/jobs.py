@@ -147,6 +147,15 @@ class BuildService:
         for d in (self.uploads_dir, self.logs_dir, self.artifacts_dir):
             d.mkdir(parents=True, exist_ok=True)
         self._run_cache: dict[int, tuple[float, dict]] = {}
+        self.setup_state: dict[str, Any] = {"status": "ok"}  # replaced by the app's auto-bootstrap state
+
+    def check_setup(self) -> None:
+        st = self.setup_state
+        if st.get("status") == "pending":
+            raise BuildError("Automatic setup is still running (usually a few seconds after a deploy); retry shortly.")
+        if st.get("status") in ("failed", "blocked"):
+            raise BuildError(f"Automatic setup has not succeeded: {st.get('detail')}. It retries by itself every few "
+                             "minutes; call service_doctor (or GET /api/doctor) for details.")
 
     # ------------------------------------------------------------------ utils
     def _github(self) -> GitHub:
@@ -203,6 +212,7 @@ class BuildService:
         if problems:
             raise BuildError("Service is not fully configured: " + "; ".join(problems))
         gh = self._github()
+        self.check_setup()
 
         language = (language or "").strip().lower()
         if language not in PRESETS:

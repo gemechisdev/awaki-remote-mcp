@@ -107,7 +107,8 @@ class Settings:
             session_retain_minutes=_int("SESSION_RETAIN_MINUTES", 30, 1, 1440),
             max_cmd_log_mb=_int("MAX_CMD_LOG_MB", 20, 1, 200),
             max_session_artifact_mb=_int("MAX_SESSION_ARTIFACT_MB", 500, 10, 5000),
-            sync_runner_repo=os.getenv("SYNC_RUNNER_REPO", "true").strip().lower() not in {"0", "false", "no"},
+            sync_runner_repo=(os.getenv("AUTO_BOOTSTRAP") or os.getenv("SYNC_RUNNER_REPO") or "true")
+            .strip().lower() not in {"0", "false", "no"},
         )
 
     @property

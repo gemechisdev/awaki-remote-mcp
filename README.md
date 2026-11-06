@@ -42,28 +42,30 @@ GitHub → Settings → Developer settings → Fine-grained tokens → *Generate
 - Permissions: **Actions: Read and write**, **Contents: Read and write**, **Secrets: Read and write**, Metadata: Read
 - No `delete_repo`, no access to your other repos.
 
-### 3. Deploy this service
-Render (Docker) or Koyeb. Set the environment variables (see `.env.example`):
+### 3. Deploy this service (that's the whole setup: no shell needed)
+Render (Docker) or Koyeb free tier. Set these environment variables in the host's dashboard:
 
 | Variable | Value |
 |---|---|
-| `MCP_API_TOKEN` | `openssl rand -hex 32` |
+| `MCP_API_TOKEN` | a random string, 32+ characters (Render can generate one: see `render.yaml`) |
 | `GITHUB_TOKEN` | the token from step 2 |
 | `GITHUB_REPO` | `you/my-build-runner` |
-| `PUBLIC_URL` | your service URL (auto-detected on Render/Koyeb) |
+| `PUBLIC_URL` | only if auto-detection fails (Render and Koyeb URLs are detected automatically) |
 
-On startup the service pushes `build.yml` and `runner.py` to the repo, and keeps them in sync after
-every deploy (`SYNC_RUNNER_REPO=true`).
+**On every start the service sets itself up automatically**, in the background, with retries:
+1. pushes `build.yml` and `runner.py` to the runner repo (only when they changed),
+2. sets the two repository secrets the runner needs (`RB_SERVICE_URL`, `RB_RUNNER_TOKEN`, encrypted),
+3. verifies everything (public repo, files, secrets) and re-checks every 6 hours.
 
-### 4. Push the secrets once and verify
-Run locally (or in the host's shell) with the same env vars:
+If the token is missing a permission or the repo has no `main` branch, setup reports the exact problem and keeps
+retrying every few minutes, so fixing the token in GitHub is enough (no redeploy). Until setup has succeeded, builds
+and sessions are refused with that message instead of failing mysteriously.
 
-```bash
-pip install -r requirements.txt
-python -m app.cli bootstrap   # pushes workflow files + sets RB_SERVICE_URL / RB_RUNNER_TOKEN secrets, then runs doctor
-python -m app.cli doctor      # re-check any time
-```
-`doctor` tells you in plain words what is missing (private repo, stale workflow, missing secrets...).
+### 4. Check that it worked (optional, no shell)
+- Open `https://YOUR-SERVICE/health`: `"setup":"ok"` means the runner repo is ready (`pending` for the first seconds).
+- Details, from any computer or phone: `curl -H "Authorization: Bearer <MCP_API_TOKEN>" https://YOUR-SERVICE/api/doctor`
+  (or have your agent call the `service_doctor` MCP tool). `POST /api/bootstrap` (tool: `service_setup`) re-runs setup on demand.
+- The `python -m app.cli bootstrap|doctor` command still exists for people who do have a shell, but is never required.
 
 ### 5. Connect your agent
 - **MCP (Streamable HTTP):** URL `https://YOUR-SERVICE/mcp`, header `Authorization: Bearer <MCP_API_TOKEN>`.
