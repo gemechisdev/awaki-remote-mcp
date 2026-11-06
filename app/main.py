@@ -42,8 +42,9 @@ Two modes:
 
 Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
 Secrets only via env=. Languages: android kotlin java rust go python node cpp flutter generic.
-Artifacts (build + session) use temporary signed urls — no Bearer on the download URL.
-Live build logs: long-poll read_build_output, or WebSocket (get_build_log_stream_url).
+For HTTP upload/download and WebSocket logs: call create_access_token once, then use that Bearer
+(or ?token=) — never scrape the long-lived MCP secret. Artifacts also offer signed urls.
+Live logs: read_build_output (long-poll) or WebSocket via get_build_log_stream_url + access token.
 Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
 """
 
@@ -129,20 +130,49 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return await guard(svc.status(job_id))
 
     @mcp.tool()
+    async def create_access_token(ttl_seconds: int = 3600,
+                                  scopes: list[str] | None = None) -> dict:
+        """Mint a temporary client token for HTTP upload/download and WebSocket log streaming.
+
+        Call once after connecting to MCP. Use the returned access_token as:
+          Authorization: Bearer <access_token>
+        or ?token=<access_token> on WebSockets. Does not expose the long-lived MCP API secret.
+        scopes: subset of upload, download, logs, api (default = all). Valid until expires_at.
+        """
+        from .config import make_client_token
+        from datetime import datetime, timezone
+        token, exp, used = make_client_token(s.mcp_api_token, scopes, ttl_seconds)
+        base = (s.public_url or "").rstrip("/") or "https://YOUR-SERVICE"
+        return {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_at": datetime.fromtimestamp(exp, timezone.utc).isoformat(timespec="seconds"),
+            "expires_in": max(0, exp - int(time.time())),
+            "scopes": used,
+            "usage": {
+                "http_header": f"Authorization: Bearer {token}",
+                "websocket_query": f"?token={token}",
+                "upload": f"POST {base}/upload",
+                "download": "Bearer on /api/.../artifact, or use signed urls from download_artifact",
+                "live_logs": f"{base.replace('https://', 'wss://').replace('http://', 'ws://')}/ws/builds/{{job_id}}/logs?token={token}",
+            },
+            "note": "Use this token for agent-side HTTP/WS. Keep the MCP Bearer only for MCP tool calls.",
+        }
+
+    @mcp.tool()
     async def read_build_output(job_id: str, offset: int = 0, wait_seconds: int = 25,
                                 max_chars: int = 30000, tail: bool = False) -> dict:
         """Stream live build logs (long-poll). Same idea as session read_output.
 
         Call while the build is running; pass next_offset from the previous response.
-        For true push streaming, connect a WebSocket to:
-          wss://YOUR-SERVICE/ws/builds/{job_id}/logs?token=<MCP_API_TOKEN>
-        Prefer this or the WebSocket over get_build_logs for long Android/Flutter/Gradle builds.
+        For push streaming: create_access_token → WebSocket
+          wss://…/ws/builds/{job_id}/logs?token=<access_token>
         """
         return await guard(svc.read_output(job_id, offset, max_chars, wait_seconds, tail))
 
     @mcp.tool()
     async def get_build_log_stream_url(job_id: str) -> dict:
-        """WebSocket URL for live build log streaming (push). Auth via ?token=<MCP_API_TOKEN>."""
+        """WebSocket URL template for live build logs. Call create_access_token and put access_token in ?token=."""
         jid = svc.check_job_id(job_id)
         base = (s.public_url or "").rstrip("/")
         if base.startswith("https://"):
@@ -151,12 +181,10 @@ def create_app(settings: Settings | None = None) -> Starlette:
             ws = "ws://" + base[len("http://"):]
         else:
             ws = base or "wss://YOUR-SERVICE"
-        url = f"{ws}/ws/builds/{jid}/logs?token=<MCP_API_TOKEN>"
         return {
             "job_id": jid,
-            "websocket_url": url,
-            "note": "Replace <MCP_API_TOKEN> with the same Bearer token used for MCP. "
-                    "Text frames are raw log chunks; connection closes when the build finishes.",
+            "websocket_url_template": f"{ws}/ws/builds/{jid}/logs?token=<ACCESS_TOKEN>",
+            "how": "create_access_token → substitute access_token into the URL.",
             "long_poll_alternative": "read_build_output(job_id, offset, wait_seconds)",
         }
 

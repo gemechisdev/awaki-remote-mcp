@@ -69,6 +69,50 @@ def verify_download_token(mcp_api_token: str, kind: str, resource_id: str, name:
     return hmac.compare_digest(sig, expected)
 
 
+# Client access tokens: minted by authenticated MCP tool; used for HTTP/WS by the agent
+_CLIENT_SCOPES = frozenset({"upload", "download", "logs", "api"})
+
+
+def make_client_token(mcp_api_token: str, scopes: list[str] | None = None,
+                      ttl_seconds: int = 3600) -> tuple[str, int, list[str]]:
+    """Issue a temporary client token. Stateless (HMAC); valid until expiry across restarts.
+
+    Returns (token, expires_unix, scopes). Default scopes cover upload, download, logs, api.
+    """
+    allowed = sorted(_CLIENT_SCOPES if not scopes else (set(scopes) & _CLIENT_SCOPES))
+    if not allowed:
+        allowed = sorted(_CLIENT_SCOPES)
+    expires = int(time.time()) + max(60, min(int(ttl_seconds), 86400))
+    scope_s = ",".join(allowed)
+    payload = f"client:v1:{scope_s}:{expires}"
+    sig = hmac.new(mcp_api_token.encode(), payload.encode(), hashlib.sha256).hexdigest()[:40]
+    return f"ct.{expires}.{scope_s.replace(',', '+')}.{sig}", expires, allowed
+
+
+def verify_client_token(mcp_api_token: str, token: str, need_scope: str | None = None) -> bool:
+    """Validate a client access token; optionally require a scope (upload|download|logs|api)."""
+    if not token or not mcp_api_token or not token.startswith("ct."):
+        return False
+    parts = token.split(".")
+    if len(parts) != 4:
+        return False
+    _, exp_s, scope_enc, sig = parts
+    try:
+        expires = int(exp_s)
+    except ValueError:
+        return False
+    if expires < int(time.time()):
+        return False
+    scope_s = scope_enc.replace("+", ",")
+    payload = f"client:v1:{scope_s}:{expires}"
+    expected = hmac.new(mcp_api_token.encode(), payload.encode(), hashlib.sha256).hexdigest()[:40]
+    if not hmac.compare_digest(sig, expected):
+        return False
+    if need_scope:
+        return need_scope in scope_s.split(",")
+    return True
+
+
 def _public_url() -> str:
     url = os.getenv("PUBLIC_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
     if not url and os.getenv("KOYEB_PUBLIC_DOMAIN"):

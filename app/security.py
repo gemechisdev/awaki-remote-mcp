@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import Settings, derive_session_token, verify_download_token
+from .config import Settings, derive_session_token, verify_download_token, verify_client_token
 from urllib.parse import parse_qs
 
 
@@ -78,38 +78,69 @@ class AuthMiddleware:
                                     headers={"Retry-After": "300"})
                 await resp(scope, receive, send)
             return
-        # Temporary download tokens (HTTP artifact GETs)
+        # Per-resource temporary download tokens (HTTP artifact GETs)
         if scope["type"] == "http" and self._allow_download_token(path, qs):
             await self.app(scope, receive, send)
             return
-        # WebSocket live logs: /ws/... ?token=<MCP_API_TOKEN>
+        # WebSocket live logs: accept MCP token OR client token with logs scope
         if scope["type"] == "websocket" and path.startswith("/ws/"):
             params = parse_qs(qs.decode("latin-1", "replace"))
             tok = (params.get("token") or [""])[0] or bearer(headers)
-            if tokens_equal(tok, self.settings.mcp_api_token):
+            ok = (tokens_equal(tok, self.settings.mcp_api_token)
+                  or verify_client_token(self.settings.mcp_api_token, tok, "logs"))
+            if ok:
                 await self.app(scope, receive, send)
                 return
             self._fails[who].append(time.time())
             await send({"type": "websocket.close", "code": 4401})
             return
+        # Runner callbacks keep their own tokens
         if path.startswith("/srunner/"):
             parts = path.split("/")
             sid = parts[2] if len(parts) > 2 else ""
             expected = derive_session_token(self.settings.runner_token, sid) if sid and self.settings.runner_token else ""
+            if tokens_equal(bearer(headers), expected):
+                await self.app(scope, receive, send)
+                return
         elif path.startswith("/runner/"):
-            expected = self.settings.runner_token
+            if tokens_equal(bearer(headers), self.settings.runner_token):
+                await self.app(scope, receive, send)
+                return
         else:
-            expected = self.settings.mcp_api_token
-        if not tokens_equal(bearer(headers), expected):
-            self._fails[who].append(time.time())
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 4401})
-            else:
-                resp = JSONResponse({"error": "Unauthorized"}, status_code=401,
-                                    headers={"WWW-Authenticate": "Bearer"})
-                await resp(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
+            # MCP master token OR temporary client token (scoped)
+            supplied = bearer(headers)
+            if tokens_equal(supplied, self.settings.mcp_api_token):
+                await self.app(scope, receive, send)
+                return
+            need = self._client_scope_for_path(path, scope.get("method", b"GET").decode()
+                                              if isinstance(scope.get("method"), bytes) else scope.get("method", "GET"))
+            if need and verify_client_token(self.settings.mcp_api_token, supplied, need):
+                await self.app(scope, receive, send)
+                return
+            # Client token with any scope still allowed for generic /api reads if it has api
+            if verify_client_token(self.settings.mcp_api_token, supplied, "api"):
+                await self.app(scope, receive, send)
+                return
+        self._fails[who].append(time.time())
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4401})
+        else:
+            resp = JSONResponse({"error": "Unauthorized"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer"})
+            await resp(scope, receive, send)
+
+    def _client_scope_for_path(self, path: str, method: str) -> str | None:
+        """Map path → required client-token scope."""
+        m = method.upper()
+        if path in ("/upload",) or path.startswith("/upload"):
+            return "upload"
+        if "/artifact" in path and m == "GET":
+            return "download"
+        if path.startswith("/ws/"):
+            return "logs"
+        if path.startswith("/api/"):
+            return "api"
+        return "api"
 
     def _allow_download_token(self, path: str, query_string: bytes) -> bool:
         """Allow GET of build/session artifacts when a valid short-lived ?token= is present."""
