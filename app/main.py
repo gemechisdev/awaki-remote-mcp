@@ -33,15 +33,14 @@ from .sessions_http import register_session_tools, session_routes
 log = logging.getLogger("remote-build")
 
 INSTRUCTIONS = """\
-Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Reach for them whenever the work is heavier than your current environment — long compiles, Gradle/Android/Flutter, native builds, big test suites, or anything that needs more CPU/RAM/time.
+Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Reach for them when the work is heavier than your current environment — long compiles, Gradle/Android/Flutter, native builds, big test suites, or anything that needs more CPU/RAM/time.
 
 Two modes:
-• BUILD (one-shot): source → submit_build → wait_for_build → download_artifact
-• SESSION (interactive shell): open_session → exec_command (+ read_output) → put_files / collect_artifacts → close_session
+• BUILD: source → submit_build → wait_for_build → download_artifact
+• SESSION: open_session → exec_command (+ read_output) → put_files / collect_artifacts → close_session
 
-Source (exactly one): public git_url (preferred) or upload ZIP (upload_source for pure MCP, or POST /upload).
-Pass secrets only via env= (masked). Prefer webhook_url over polling.
-Presets: android, kotlin, java, rust, go, python, node, cpp, flutter, generic (see get_build_presets).
+Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
+Secrets only via env= (masked). Prefer webhook_url over polling. Languages: android kotlin java rust go python node cpp flutter generic (get_build_presets for defaults).
 Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
 """
 
@@ -97,13 +96,14 @@ def create_app(settings: Settings | None = None) -> Starlette:
         toolchain: dict[str, str] | None = None,
         webhook_url: str | None = None,
     ) -> dict:
-        """Start a one-shot remote build on a 4 vCPU / 16 GB runner. Use for compiles, packaging, or tests that are slow or heavy on your current machine.
+        """Start a one-shot remote build on a 4 vCPU / 16 GB runner. Use for compiles, packaging, or tests that are slow or heavy locally.
 
         Source (exactly one): upload_id or public git_url (+ optional git_ref).
-        language picks a preset (command + artifact globs); override with build_command / artifact_paths.
-        working_directory for monorepos. env for secrets (masked). package: 'auto'|'zip'.
-        return_artifacts=false for test-only runs. webhook_url (https) gets a finish JSON POST.
-        Then wait_for_build or rely on the webhook; on success use download_artifact.
+        language: android|kotlin|java|rust|go|python|node|cpp|flutter|generic (preset fills command + artifact globs).
+        Override with build_command / artifact_paths. working_directory for monorepos. env for secrets (masked).
+        package: 'auto'|'zip'. return_artifacts defaults true (set false for test-only). webhook_url gets a finish POST.
+        Example: language='android', upload_id='…', build_command='./gradlew assembleDebug'
+        Then wait_for_build → download_artifact.
         """
         return await guard(svc.submit(
             language=language, upload_id=upload_id, git_url=git_url, git_ref=git_ref,
@@ -196,10 +196,10 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def upload_source(zip_base64: str) -> dict:
-        """Upload a project ZIP as base64 (pure MCP). Returns upload_id for submit_build / open_session.
+        """Upload a project ZIP as base64 (pure MCP). Returns upload_id (expires after ~2 h) for submit_build / open_session.
 
-        Soft limit ~30 MB decoded. For larger projects prefer git_url or binary POST /upload.
-        Accepts optional data: URI prefix. Zip source only (no .git / node_modules / build caches).
+        Soft limit ~30 MB decoded; larger projects → git_url or binary POST /upload.
+        Accepts optional data: URI prefix. Zip source only (exclude .git, node_modules, build caches).
         """
         # Strip optional data-URI prefix if an agent includes it
         raw = zip_base64.strip()

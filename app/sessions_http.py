@@ -198,10 +198,10 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
     ) -> dict:
         """Open a temporary remote shell (4 vCPU / 16 GB, Ubuntu, sudo) with the project loaded.
 
-        Reach for this when the work is heavier than your current environment: Gradle/Android/Flutter builds,
-        native compiles, large test suites, npm/cargo installs that take too long, or multi-step debugging.
-        Source: upload_id or public git_url. language selects toolchain. ttl/idle/retain control lifetime.
-        env applies to every command. webhook_url (https) gets a finish JSON POST. Auto-expires.
+        Use when the work is heavier than your current environment: Gradle/Android/Flutter, native compiles,
+        large test suites, slow npm/cargo installs, or multi-step debugging.
+        Source: upload_id or public git_url. language: android|kotlin|java|rust|go|python|node|cpp|flutter|generic.
+        ttl/idle/retain control lifetime. env for secrets. webhook_url gets a finish POST. Auto-expires.
         """
         return await guard(svc.open(
             upload_id=upload_id, git_url=git_url, git_ref=git_ref, language=language,
