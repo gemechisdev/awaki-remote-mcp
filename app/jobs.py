@@ -580,31 +580,30 @@ class BuildService:
         return files[0]
 
     def artifact_info(self, job_id: str, name: str | None = None) -> dict | None:
+        from .config import make_download_token
         files = self.artifact_files(job_id)
         if not files:
             return None
-        note = ("GET the download path with 'Authorization: Bearer <token>'. "
-                "Files are kept only temporarily; download promptly.")
+        note = ("url is a temporary signed link (no Bearer token needed). Download promptly.")
+        ttl = min(3600, self.s.artifact_ttl_minutes * 60)
+
+        def _item(f: Path, multi: bool) -> dict:
+            token_name = f.name if multi else "*"
+            token, exp = make_download_token(self.s.mcp_api_token, "build", job_id, token_name, ttl)
+            path = (f"/api/builds/{job_id}/artifact/{f.name}" if multi
+                    else f"/api/builds/{job_id}/artifact")
+            return {
+                "filename": f.name, "size_bytes": f.stat().st_size,
+                "download": f"{path}?token={token}",
+                "expires_at": _iso(exp),
+            }
+
         if name or len(files) == 1:
             f = self.artifact_file(job_id, name)
             if not f:
                 return None
-            expires = f.stat().st_mtime + self.s.artifact_ttl_minutes * 60
-            return {
-                "filename": f.name, "size_bytes": f.stat().st_size,
-                "download": f"/api/builds/{job_id}/artifact/{f.name}" if len(files) > 1
-                            else f"/api/builds/{job_id}/artifact",
-                "expires_at": _iso(expires), "note": note,
-            }
-        # Multiple named artifacts
-        items = []
-        for f in files:
-            expires = f.stat().st_mtime + self.s.artifact_ttl_minutes * 60
-            items.append({
-                "filename": f.name, "size_bytes": f.stat().st_size,
-                "download": f"/api/builds/{job_id}/artifact/{f.name}",
-                "expires_at": _iso(expires),
-            })
+            return {**_item(f, multi=len(files) > 1), "note": note}
+        items = [_item(f, multi=True) for f in files]
         return {"artifacts": items, "count": len(items), "note": note}
 
     async def store_artifact(self, job_id: str, filename: str, chunks: AsyncIterator[bytes],

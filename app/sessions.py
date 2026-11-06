@@ -359,15 +359,27 @@ class SessionService:
 
     # --------------------------------------------------------------- artifacts
     def artifacts(self, sid: str) -> list[dict]:
+        from .config import make_download_token
         d = self.art_dir(sid)
         s = self.db.get_session(sid)
         if not d.exists() or not s:
             return []
         retain = int((s["spec"] or {}).get("retain_minutes", 30))
         until = s["retain_until"] or (s["expires_at"] + retain * 60)
-        return [{"name": f.name, "size_bytes": f.stat().st_size, "download": f"/api/sessions/{sid}/artifacts/{f.name}",
-                 "available_until_at_least": _iso(until)}
-                for f in sorted(d.iterdir()) if f.is_file() and not f.name.endswith(".part")]
+        ttl = min(3600, retain * 60)
+        out = []
+        for f in sorted(d.iterdir()):
+            if not f.is_file() or f.name.endswith(".part"):
+                continue
+            token, exp = make_download_token(self.s.mcp_api_token, "session", sid, f.name, ttl)
+            path = f"/api/sessions/{sid}/artifacts/{f.name}?token={token}"
+            out.append({
+                "name": f.name, "size_bytes": f.stat().st_size,
+                "download": path, "url_path": path,
+                "expires_at": _iso(exp),
+                "available_until_at_least": _iso(until),
+            })
+        return out
 
     def artifact_path(self, sid: str, name: str) -> Path | None:
         self.check_id(sid)

@@ -37,11 +37,12 @@ Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Rea
 
 Two modes:
 • BUILD: source → submit_build → read_build_output (live) / wait_for_build → download_artifact
-• SESSION: open_session → exec_command (+ read_output) → put_files / collect_artifacts → close_session
+• SESSION: open_session → exec_command (+ read_output) → put_files / collect_artifacts → list_session_artifacts
 
 Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
-Secrets only via env= (masked). Prefer webhook_url over polling. Languages: android kotlin java rust go python node cpp flutter generic (get_build_presets for defaults).
-Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
+Secrets only via env= (masked). Prefer webhook_url over polling. Languages: android kotlin java rust go python node cpp flutter generic (get_build_presets).
+Artifacts return temporary signed urls (no Bearer token needed). Sessions auto-expire.
+Commands start in project root; cd/export do not persist — chain with &&.
 """
 
 
@@ -145,7 +146,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def get_artifact_info(job_id: str, name: str | None = None) -> dict:
-        """Download URL(s) + metadata for finished artifact(s). Use name= when package='named' produced several files."""
+        """Signed download URL(s) + metadata for finished artifact(s). No Bearer token needed on the URL.
+        Use name= when package='named' produced several files."""
         info = svc.artifact_info(svc.check_job_id(job_id), name)
         if not info:
             raise ValueError("No artifact available (build not finished, failed, expired, or return_artifacts=false)")
@@ -153,8 +155,10 @@ def create_app(settings: Settings | None = None) -> Starlette:
         if "artifacts" in info:  # multi
             for item in info["artifacts"]:
                 item["url"] = (base + item["download"]) if base else item["download"]
+                item["curl"] = f"curl -sS -L -o '{item['filename']}' '{item['url']}'"
             return info
-        return {**info, "url": (base + info["download"]) if base else info["download"]}
+        url = (base + info["download"]) if base else info["download"]
+        return {**info, "url": url, "curl": f"curl -sS -L -o '{info['filename']}' '{url}'"}
 
     @mcp.tool()
     async def cancel_build(job_id: str) -> dict:
@@ -250,33 +254,29 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def download_artifact(job_id: str, name: str | None = None, as_base64: bool = False) -> dict:
-        """Get a finished artifact: always returns url + metadata. Optionally include base64 if ≤15 MB.
+        """Get a finished artifact. Returns a temporary signed url (no Bearer token needed) + metadata.
 
-        When package='named' produced several files, pass name= (or call get_artifact_info first for the list).
-        Prefer the URL for large files; as_base64 only when binary HTTP is unavailable.
+        When package='named' produced several files, pass name= (or call get_artifact_info first).
+        Prefer the signed url for large files (APKs, zips). as_base64 only when ≤15 MB and no HTTP GET.
         """
         info = svc.artifact_info(svc.check_job_id(job_id), name)
         if not info:
             raise ValueError(
                 "No artifact available (build not finished, failed, expired, or return_artifacts=false)"
             )
+        base = (s.public_url or "").rstrip("/")
         if "artifacts" in info:
-            # Multi: return the list; caller picks one with name=
-            base = (s.public_url or "").rstrip("/")
             for item in info["artifacts"]:
                 item["url"] = (base + item["download"]) if base else item["download"]
-            info["hint"] = "Multiple artifacts. Call again with name='…' (or use the urls above)."
+                item["curl"] = f"curl -sS -L -o '{item['filename']}' '{item['url']}'"
+            info["hint"] = "Multiple artifacts. Call again with name='…' or use the signed urls above (no auth header)."
             return info
-        base = (s.public_url or "").rstrip("/")
         url = (base + info["download"]) if base else info["download"]
         result: dict[str, Any] = {
             **info,
             "url": url,
-            "auth_header": "Authorization: Bearer <your-MCP_API_TOKEN>",
-            "curl": (
-                f"curl -sS -L -H 'Authorization: Bearer <your-MCP_API_TOKEN>' "
-                f"-o '{info['filename']}' '{url}'"
-            ),
+            "curl": f"curl -sS -L -o '{info['filename']}' '{url}'",
+            "note": "Signed temporary URL — no Authorization header required.",
         }
         if as_base64:
             path = svc.artifact_file(job_id, name)
@@ -286,7 +286,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
             max_b64 = 15 * 1024 * 1024
             if size > max_b64:
                 result["base64_omitted"] = (
-                    f"File is {size} bytes (> 15 MB). Download via the url/curl instead."
+                    f"File is {size} bytes (> 15 MB). Use the signed url/curl instead."
                 )
             else:
                 result["content_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")

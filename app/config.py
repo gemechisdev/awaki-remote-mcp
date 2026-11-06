@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,34 @@ def derive_session_token(runner_token: str, session_id: str) -> str:
     token is used just once, by the fetch step, and is not present while your commands run.
     """
     return hmac.new(runner_token.encode(), f"session:{session_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_download_token(mcp_api_token: str, kind: str, resource_id: str, name: str,
+                        ttl_seconds: int = 3600) -> tuple[str, int]:
+    """Short-lived signed download token. Agents use the resulting URL without the MCP token.
+
+    Returns (token, expires_unix). kind is 'build' or 'session'.
+    """
+    expires = int(time.time()) + max(60, min(ttl_seconds, 86400))
+    payload = f"dl:v1:{kind}:{resource_id}:{name}:{expires}"
+    sig = hmac.new(mcp_api_token.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{expires}.{sig}", expires
+
+
+def verify_download_token(mcp_api_token: str, kind: str, resource_id: str, name: str, token: str) -> bool:
+    """Validate a temporary download token. Constant-time where practical."""
+    if not token or not mcp_api_token or "." not in token:
+        return False
+    try:
+        exp_s, sig = token.split(".", 1)
+        expires = int(exp_s)
+    except ValueError:
+        return False
+    if expires < int(time.time()):
+        return False
+    payload = f"dl:v1:{kind}:{resource_id}:{name}:{expires}"
+    expected = hmac.new(mcp_api_token.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(sig, expected)
 
 
 def _public_url() -> str:

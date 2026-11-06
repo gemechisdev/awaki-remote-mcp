@@ -264,9 +264,17 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
 
     @mcp.tool()
     async def list_session_artifacts(session_id: str) -> dict:
-        """Artifacts collected so far, with download paths."""
+        """Artifacts collected so far. Each item has a temporary signed url (no Bearer token needed)."""
         sid = svc.check_id(session_id)
-        return {"session_id": sid, "base_url": base, "artifacts": svc.artifacts(sid)}
+        items = svc.artifacts(sid)
+        for a in items:
+            a["url"] = base.rstrip("/") + a["download"]
+            a["curl"] = f"curl -sS -L -o '{a['name']}' '{a['url']}'"
+        return {
+            "session_id": sid,
+            "note": "Signed temporary URLs — no Authorization header required.",
+            "artifacts": items,
+        }
 
     @mcp.tool()
     async def get_session_log(session_id: str, max_chars: int = 20000) -> dict:

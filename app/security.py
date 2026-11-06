@@ -11,7 +11,8 @@ from pathlib import Path, PurePosixPath
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import Settings, derive_session_token
+from .config import Settings, derive_session_token, verify_download_token
+from urllib.parse import parse_qs
 
 
 def tokens_equal(supplied: str, expected: str) -> bool:
@@ -73,6 +74,10 @@ class AuthMiddleware:
                                 headers={"Retry-After": "300"})
             await resp(scope, receive, send)
             return
+        # Temporary download tokens: agents get a signed URL without the long-lived MCP token
+        if self._allow_download_token(path, scope.get("query_string", b"")):
+            await self.app(scope, receive, send)
+            return
         if path.startswith("/srunner/"):  # interactive session runner: per-session token
             parts = path.split("/")
             sid = parts[2] if len(parts) > 2 else ""
@@ -88,6 +93,31 @@ class AuthMiddleware:
             await resp(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+    def _allow_download_token(self, path: str, query_string: bytes) -> bool:
+        """Allow GET of build/session artifacts when a valid short-lived ?token= is present."""
+        if not path.startswith("/api/builds/") and not path.startswith("/api/sessions/"):
+            return False
+        if "/artifact" not in path:
+            return False
+        qs = parse_qs(query_string.decode("latin-1", "replace"))
+        token = (qs.get("token") or [""])[0]
+        if not token:
+            return False
+        parts = path.strip("/").split("/")
+        # /api/builds/{job_id}/artifact[/{name}]
+        # /api/sessions/{sid}/artifacts/{name}
+        try:
+            if parts[1] == "builds" and len(parts) >= 4 and parts[3] == "artifact":
+                job_id, name = parts[2], parts[4] if len(parts) > 4 else ""
+                # When no name in path, token is bound to empty name or the single file
+                return verify_download_token(self.settings.mcp_api_token, "build", job_id, name or "*", token)
+            if parts[1] == "sessions" and len(parts) >= 5 and parts[3] == "artifacts":
+                sid, name = parts[2], parts[4]
+                return verify_download_token(self.settings.mcp_api_token, "session", sid, name, token)
+        except Exception:
+            return False
+        return False
 
 
 # ---------------------------------------------------------------------------
