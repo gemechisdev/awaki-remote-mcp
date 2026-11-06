@@ -1,0 +1,27 @@
+name: Trigger Koyeb Redeploy
+
+on:
+  push:
+    branches:
+      - main # Change this to your default branch if it's different (e.g., master)
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Redeploy Request to Koyeb
+        run: |
+          response=$(curl -s -w "%{http_code}" -X POST "https://app.koyeb.com/v1/services/${{ secrets.KOYEB_SERVICE_ID }}/redeploy" \
+               -H "Authorization: Bearer ${{ secrets.KOYEB_API_TOKEN }}" \
+               -H "Content-Type: application/json")
+          
+          http_code=$(echo "$response" | tail -c 4)
+          body=$(echo "$response" | head -c -4)
+          
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "Successfully triggered Koyeb build!"
+          else
+            echo "Failed to trigger Koyeb build. HTTP status: $http_code"
+            echo "Response: $body"
+            exit 1
+          fi
