@@ -256,7 +256,10 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
     @mcp.tool()
     async def collect_artifacts(session_id: str, paths: str, package: str = "auto", name: str | None = None,
                                 cwd: str | None = None, wait_seconds: int = 120) -> dict:
-        """Copy matching files (newline globs, supports **) from the session so they can be downloaded by URL."""
+        """Copy matching files (newline globs, supports **) from the session so they can be downloaded by URL.
+
+        package: 'auto' (single→as-is, several→zip) | 'zip' | 'named' (each file kept separate with its own URL).
+        """
         return await guard(svc.collect(session_id, paths, package, name, cwd, wait_seconds))
 
     @mcp.tool()

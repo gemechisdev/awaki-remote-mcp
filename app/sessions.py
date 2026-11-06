@@ -284,8 +284,8 @@ class SessionService:
         if not lines or len(lines) > 20 or any(len(ln) > 300 for ln in lines):
             raise BuildError("paths: 1-20 newline-separated globs relative to the project (supports **)")
         lines = [_safe_rel(ln, "paths entry") for ln in lines]
-        if package not in {"auto", "zip"}:
-            raise BuildError("package must be 'auto' or 'zip'")
+        if package not in {"auto", "zip", "named"}:
+            raise BuildError("package must be 'auto', 'zip', or 'named' (each file kept separate)")
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", name or "")[:60].strip("-.") or None
         cid = self._enqueue(sid, "collect", {"paths": lines, "package": package, "name": safe_name,
                                              "cwd": validate_workdir(cwd)})

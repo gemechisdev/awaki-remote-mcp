@@ -249,8 +249,8 @@ class BuildService:
             raise BuildError("artifact_paths: at most 20 lines of 300 characters")
         art_lines = [_safe_rel(ln, "artifact_paths entry") for ln in art_lines]
 
-        if package not in {"auto", "zip"}:
-            raise BuildError("package must be 'auto' (single file as-is, several files zipped) or 'zip'")
+        if package not in {"auto", "zip", "named"}:
+            raise BuildError("package must be 'auto' (single→as-is, several→zip), 'zip', or 'named' (each file kept separate)")
 
         workdir = ""
         if working_directory and working_directory.strip("./ "):
@@ -561,26 +561,61 @@ class BuildService:
         return {"job_id": job_id, "deleted": True}
 
     # -------------------------------------------------------------- artifacts
-    def artifact_file(self, job_id: str) -> Path | None:
+    def artifact_files(self, job_id: str) -> list[Path]:
         d = self.artifact_dir(self.check_job_id(job_id))
-        files = [f for f in d.glob("*") if f.is_file() and not f.name.endswith(".part")] if d.exists() else []
-        return files[0] if files else None
+        if not d.exists():
+            return []
+        return sorted(f for f in d.glob("*") if f.is_file() and not f.name.endswith(".part"))
 
-    def artifact_info(self, job_id: str) -> dict | None:
-        f = self.artifact_file(job_id)
-        if not f:
+    def artifact_file(self, job_id: str, name: str | None = None) -> Path | None:
+        files = self.artifact_files(job_id)
+        if not files:
             return None
-        expires = f.stat().st_mtime + self.s.artifact_ttl_minutes * 60
-        return {"filename": f.name, "size_bytes": f.stat().st_size,
-                "download": f"/api/builds/{job_id}/artifact", "expires_at": _iso(expires),
-                "note": "GET the download path with 'Authorization: Bearer <token>'. "
-                        "Files are kept only temporarily; download promptly."}
+        if name:
+            safe = Path(name).name
+            for f in files:
+                if f.name == safe:
+                    return f
+            return None
+        return files[0]
 
-    async def store_artifact(self, job_id: str, filename: str, chunks: AsyncIterator[bytes]) -> dict:
-        """Receive the runner's packaged artifact (streamed to disk, size-capped)."""
-        safe = re.sub(r"[^A-Za-z0-9._ -]", "_", Path(filename or "artifact.bin").name)[:120].strip(". ") or "artifact.bin"
+    def artifact_info(self, job_id: str, name: str | None = None) -> dict | None:
+        files = self.artifact_files(job_id)
+        if not files:
+            return None
+        note = ("GET the download path with 'Authorization: Bearer <token>'. "
+                "Files are kept only temporarily; download promptly.")
+        if name or len(files) == 1:
+            f = self.artifact_file(job_id, name)
+            if not f:
+                return None
+            expires = f.stat().st_mtime + self.s.artifact_ttl_minutes * 60
+            return {
+                "filename": f.name, "size_bytes": f.stat().st_size,
+                "download": f"/api/builds/{job_id}/artifact/{f.name}" if len(files) > 1
+                            else f"/api/builds/{job_id}/artifact",
+                "expires_at": _iso(expires), "note": note,
+            }
+        # Multiple named artifacts
+        items = []
+        for f in files:
+            expires = f.stat().st_mtime + self.s.artifact_ttl_minutes * 60
+            items.append({
+                "filename": f.name, "size_bytes": f.stat().st_size,
+                "download": f"/api/builds/{job_id}/artifact/{f.name}",
+                "expires_at": _iso(expires),
+            })
+        return {"artifacts": items, "count": len(items), "note": note}
+
+    async def store_artifact(self, job_id: str, filename: str, chunks: AsyncIterator[bytes],
+                             *, append: bool = False) -> dict:
+        """Receive an artifact from the runner. append=True keeps existing files (named multi-artifact)."""
+        # Allow nested-looking names but flatten to a safe single path component
+        raw = (filename or "artifact.bin").replace("\\", "/").strip("/")
+        safe = re.sub(r"[^A-Za-z0-9._+-]", "_", Path(raw).name)[:180].strip("._") or "artifact.bin"
         d = self.artifact_dir(job_id)
-        shutil.rmtree(d, ignore_errors=True)
+        if not append:
+            shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
         tmp = d / (safe + ".part")
         limit = self.s.max_artifact_mb * 1024 * 1024
@@ -593,9 +628,14 @@ class BuildService:
                         raise BuildError(f"Artifact exceeds the service limit of {self.s.max_artifact_mb} MB")
                     sha.update(chunk)
                     out.write(chunk)
-            tmp.rename(d / safe)
+            dest = d / safe
+            if dest.exists():
+                dest.unlink()
+            tmp.rename(dest)
         except BaseException:
-            shutil.rmtree(d, ignore_errors=True)
+            tmp.unlink(missing_ok=True)
+            if not append:
+                shutil.rmtree(d, ignore_errors=True)
             raise
         return {"filename": safe, "size_bytes": size, "sha256": sha.hexdigest()}
 

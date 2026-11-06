@@ -101,10 +101,11 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Source (exactly one): upload_id or public git_url (+ optional git_ref).
         language: android|kotlin|java|rust|go|python|node|cpp|flutter|generic (preset fills command + artifact globs).
         Override with build_command / artifact_paths. working_directory for monorepos. env for secrets (masked).
-        package: 'auto'|'zip'. return_artifacts defaults true (set false for test-only). webhook_url gets a finish POST.
+        package: 'auto' (single→as-is, several→zip) | 'zip' | 'named' (each matched file kept separate with its own URL).
+        return_artifacts defaults true (set false for test-only). webhook_url gets a finish POST.
         Identical previous successful builds are reused automatically (cache_hit=true, no new runner).
         Example: language='android', upload_id='…', build_command='./gradlew assembleDebug'
-        Then read_build_output (live) / wait_for_build → download_artifact.
+        Then read_build_output (live) / wait_for_build → download_artifact (name= if package='named').
         """
         return await guard(svc.submit(
             language=language, upload_id=upload_id, git_url=git_url, git_ref=git_ref,
@@ -143,12 +144,17 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return await guard(svc.logs(job_id, tail_lines=tail_lines, errors_only=errors_only))
 
     @mcp.tool()
-    async def get_artifact_info(job_id: str) -> dict:
-        """Download URL + metadata for a finished artifact (GET with the same Bearer token)."""
-        info = svc.artifact_info(svc.check_job_id(job_id))
+    async def get_artifact_info(job_id: str, name: str | None = None) -> dict:
+        """Download URL(s) + metadata for finished artifact(s). Use name= when package='named' produced several files."""
+        info = svc.artifact_info(svc.check_job_id(job_id), name)
         if not info:
             raise ValueError("No artifact available (build not finished, failed, expired, or return_artifacts=false)")
-        return {**info, "url": (s.public_url + info["download"]) if s.public_url else info["download"]}
+        base = (s.public_url or "").rstrip("/")
+        if "artifacts" in info:  # multi
+            for item in info["artifacts"]:
+                item["url"] = (base + item["download"]) if base else item["download"]
+            return info
+        return {**info, "url": (base + info["download"]) if base else info["download"]}
 
     @mcp.tool()
     async def cancel_build(job_id: str) -> dict:
@@ -243,16 +249,24 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return await guard(svc.stage_upload(chunks()))
 
     @mcp.tool()
-    async def download_artifact(job_id: str, as_base64: bool = False) -> dict:
+    async def download_artifact(job_id: str, name: str | None = None, as_base64: bool = False) -> dict:
         """Get a finished artifact: always returns url + metadata. Optionally include base64 if ≤15 MB.
 
-        Prefer the URL (GET with same Bearer token) for large files; as_base64 only when binary HTTP is unavailable.
+        When package='named' produced several files, pass name= (or call get_artifact_info first for the list).
+        Prefer the URL for large files; as_base64 only when binary HTTP is unavailable.
         """
-        info = svc.artifact_info(svc.check_job_id(job_id))
+        info = svc.artifact_info(svc.check_job_id(job_id), name)
         if not info:
             raise ValueError(
                 "No artifact available (build not finished, failed, expired, or return_artifacts=false)"
             )
+        if "artifacts" in info:
+            # Multi: return the list; caller picks one with name=
+            base = (s.public_url or "").rstrip("/")
+            for item in info["artifacts"]:
+                item["url"] = (base + item["download"]) if base else item["download"]
+            info["hint"] = "Multiple artifacts. Call again with name='…' (or use the urls above)."
+            return info
         base = (s.public_url or "").rstrip("/")
         url = (base + info["download"]) if base else info["download"]
         result: dict[str, Any] = {
@@ -265,7 +279,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
             ),
         }
         if as_base64:
-            path = svc.artifact_file(job_id)
+            path = svc.artifact_file(job_id, name)
             if path is None:
                 raise ValueError("Artifact file disappeared (expired?)")
             size = path.stat().st_size
@@ -355,9 +369,10 @@ def create_app(settings: Settings | None = None) -> Starlette:
             job_id = svc.check_job_id(request.path_params["job_id"])
         except BuildError as exc:
             return _bad(str(exc))
-        path = svc.artifact_file(job_id)
+        name = request.path_params.get("name") or request.query_params.get("name")
+        path = svc.artifact_file(job_id, name)
         if path is None:
-            return _bad("No artifact available (not finished, failed, expired, or never collected)", 404)
+            return _bad("No artifact available (not finished, failed, expired, never collected, or unknown name)", 404)
         return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
     async def api_cancel(request: Request) -> JSONResponse:
@@ -422,8 +437,10 @@ def create_app(settings: Settings | None = None) -> Starlette:
     async def runner_artifact(request: Request) -> JSONResponse:
         try:
             job_id = _job(request)
+            append = request.query_params.get("append", "").lower() in ("1", "true", "yes")
             return JSONResponse(await svc.store_artifact(
-                job_id, request.query_params.get("filename", "artifact.bin"), request.stream()))
+                job_id, request.query_params.get("filename", "artifact.bin"), request.stream(),
+                append=append))
         except BuildError as exc:
             return _bad(str(exc), 413 if "exceeds" in str(exc) else 400)
 
@@ -506,6 +523,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/api/builds/{job_id}", api_delete, methods=["DELETE"]),
         Route("/api/builds/{job_id}/logs", api_logs, methods=["GET"]),
         Route("/api/builds/{job_id}/artifact", api_artifact, methods=["GET"]),
+        Route("/api/builds/{job_id}/artifact/{name}", api_artifact, methods=["GET"]),
         Route("/api/builds/{job_id}/cancel", api_cancel, methods=["POST"]),
         Route("/runner/{job_id}/spec", runner_spec, methods=["GET"]),
         Route("/runner/{job_id}/source", runner_source, methods=["GET"]),
