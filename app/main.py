@@ -111,6 +111,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         package: str = "auto",
         return_artifacts: bool = True,
         toolchain: dict[str, str] | None = None,
+        webhook_url: str | None = None,
     ) -> dict:
         """Start a remote build and return immediately with a job_id.
 
@@ -124,12 +125,14 @@ def create_app(settings: Settings | None = None) -> Starlette:
         package: 'auto' (a single matching file is returned as-is, several are zipped) or 'zip'.
         return_artifacts: false = build/test only, no artifact is collected (artifact_paths not needed).
         toolchain: optional {java_version, node_version, python_version, go_version}.
+        webhook_url: optional https URL; when the build finishes the service POSTs a small JSON
+            payload {event, job_id, state, ok, exit_code, ...} so you can avoid polling.
         """
         return await guard(svc.submit(
             language=language, upload_id=upload_id, git_url=git_url, git_ref=git_ref,
             build_command=build_command, artifact_paths=artifact_paths, timeout_minutes=timeout_minutes,
             working_directory=working_directory, env=env, label=label, package=package,
-            return_artifacts=return_artifacts, toolchain=toolchain))
+            return_artifacts=return_artifacts, toolchain=toolchain, webhook_url=webhook_url))
 
     @mcp.tool()
     async def wait_for_build(job_id: str, max_wait_seconds: int = 50) -> dict:

@@ -79,7 +79,8 @@ class SessionService:
                    language: str = "generic", working_directory: str | None = None,
                    env: dict[str, str] | None = None, toolchain: dict[str, str] | None = None,
                    ttl_minutes: int | None = None, idle_minutes: int | None = None,
-                   retain_minutes: int | None = None, label: str | None = None) -> dict:
+                   retain_minutes: int | None = None, label: str | None = None,
+                   webhook_url: str | None = None) -> dict:
         problems = self.s.problems()
         if problems:
             raise BuildError("Service is not fully configured: " + "; ".join(problems))
@@ -105,6 +106,13 @@ class SessionService:
         ttl = _clamp(ttl_minutes, 60, 5, self.s.max_session_minutes)
         idle = _clamp(idle_minutes, self.s.session_idle_minutes, 5, 240)
         retain = _clamp(retain_minutes, self.s.session_retain_minutes, 1, 1440)
+        webhook = None
+        if webhook_url:
+            from urllib.parse import urlparse
+            u = urlparse(webhook_url.strip())
+            if u.scheme != "https" or not u.netloc or len(webhook_url) > 500:
+                raise BuildError("webhook_url must be a short https URL")
+            webhook = webhook_url.strip()
         sid = "rs-" + secrets.token_hex(8)
         spec = {
             "label": _clean_text(label or "", 80) or language, "language": language,
@@ -113,6 +121,8 @@ class SessionService:
             "toolchain": validate_toolchain(toolchain), "source": source,
             "max_extract_mb": self.s.max_extract_mb, "max_artifact_mb": self.s.max_artifact_mb,
         }
+        if webhook:
+            spec["webhook_url"] = webhook
         self.db.create_session(sid, spec, upload_id, time.time() + ttl * 60)
         try:
             run_id = await self.gh.dispatch(self.s.github_ref, {"job_id": sid, "language": language, "mode": "session"})
@@ -159,6 +169,28 @@ class SessionService:
         self.db.update_session(s["session_id"], state=state, note=note, closed_at=s["closed_at"] or now,
                                retain_until=now + retain * 60)
         self.db.cancel_queued_commands(s["session_id"])
+        url = (s.get("spec") or {}).get("webhook_url")
+        if url:
+            try:
+                payload = {
+                    "event": "session.finished",
+                    "session_id": s["session_id"],
+                    "state": state,
+                    "note": note,
+                    "label": (s.get("spec") or {}).get("label"),
+                    "language": (s.get("spec") or {}).get("language"),
+                }
+                asyncio.get_event_loop().create_task(self._fire_webhook(url, payload))
+            except RuntimeError:
+                pass
+
+    async def _fire_webhook(self, url: str, payload: dict) -> None:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(url, json=payload, headers={"User-Agent": "remote-build-mcp/webhook"})
+        except Exception:
+            pass
 
     async def status(self, sid: str) -> dict:
         s = await self._check_opening(self._get(sid))

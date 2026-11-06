@@ -207,7 +207,8 @@ class BuildService:
                      artifact_paths: str | None = None, timeout_minutes: int | None = None,
                      working_directory: str | None = None, env: dict[str, str] | None = None,
                      label: str | None = None, package: str = "auto", return_artifacts: bool = True,
-                     toolchain: dict[str, str] | None = None) -> dict:
+                     toolchain: dict[str, str] | None = None,
+                     webhook_url: str | None = None) -> dict:
         problems = self.s.problems()
         if problems:
             raise BuildError("Service is not fully configured: " + "; ".join(problems))
@@ -275,6 +276,14 @@ class BuildService:
 
         timeout = max(1, min(int(timeout_minutes or 30), self.s.max_build_minutes))
 
+        webhook = None
+        if webhook_url:
+            from urllib.parse import urlparse
+            u = urlparse(webhook_url.strip())
+            if u.scheme != "https" or not u.netloc or len(webhook_url) > 500:
+                raise BuildError("webhook_url must be a short https URL")
+            webhook = webhook_url.strip()
+
         if self.db.active_count(max_age_s=(self.s.max_build_minutes + 20) * 60) >= self.s.max_concurrent_builds:
             raise BuildError(f"{self.s.max_concurrent_builds} builds are already active; wait for one to finish")
 
@@ -294,6 +303,8 @@ class BuildService:
             "source": source,
             "max_extract_mb": self.s.max_extract_mb,
         }
+        if webhook:
+            spec["webhook_url"] = webhook
         self.db.create_job(job_id, spec, upload_id)
         try:
             run_id = await gh.dispatch(self.s.github_ref, {"job_id": job_id, "language": language, "mode": "build"})
@@ -544,8 +555,43 @@ class BuildService:
             log = b"[... earlier output truncated by the service ...]\n" + log[-cap:]
         if log:
             self.log_path(job_id).write_bytes(log)
+        job = self.db.get_job(job_id)
         self.db.upsert_completed(job_id, clean, spec)
         self._release_source(job_id)
+        webhook = (job or {}).get("spec") or {}
+        if isinstance(webhook, dict):
+            url = webhook.get("webhook_url")
+            if url:
+                try:
+                    asyncio.get_event_loop().create_task(self._fire_webhook(url, job_id, clean, "build"))
+                except RuntimeError:
+                    pass  # no running loop (e.g. tests)
+
+    async def _fire_webhook(self, url: str, job_id: str, result: dict, kind: str = "build") -> None:
+        """POST a small JSON payload when a job finishes. Fire-and-forget; never raise to caller."""
+        import httpx
+        state = "succeeded" if result.get("ok") else (
+            "timed_out" if result.get("timed_out") else "failed")
+        if result.get("delivery_error"):
+            state = "delivery_failed"
+        payload = {
+            "event": f"{kind}.finished",
+            "job_id": job_id,
+            "state": state,
+            "ok": bool(result.get("ok")),
+            "exit_code": result.get("exit_code"),
+            "timed_out": bool(result.get("timed_out")),
+            "build_seconds": result.get("build_seconds"),
+            "label": result.get("label"),
+            "language": result.get("language"),
+            "artifact": result.get("artifact") or result.get("package"),
+            "reason": result.get("reason") or result.get("delivery_error"),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(url, json=payload, headers={"User-Agent": "remote-build-mcp/webhook"})
+        except Exception:
+            pass  # best-effort; never fail the job because of the webhook
 
     # --------------------------------------------------------------- cleanup
     def _release_source(self, job_id: str, force: bool = False) -> None:

@@ -194,6 +194,7 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
         idle_minutes: int = 30,
         retain_minutes: int = 30,
         label: str | None = None,
+        webhook_url: str | None = None,
     ) -> dict:
         """Open a temporary remote shell on a GitHub Actions VM (4 vCPU / 16 GB, Ubuntu, sudo) with your project loaded.
 
@@ -202,12 +203,14 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
         language picks preinstalled toolchains (android, kotlin, java, rust, go, python, node, cpp, flutter, generic).
         ttl_minutes: hard lifetime (max 180). idle_minutes: auto-close when unused. retain_minutes: how long logs and
         collected artifacts stay downloadable after the session ends. env: variables for every command.
+        webhook_url: optional https URL; when the session ends the service POSTs a small JSON payload.
         The session closes itself and all its data is deleted automatically.
         """
         return await guard(svc.open(
             upload_id=upload_id, git_url=git_url, git_ref=git_ref, language=language,
             working_directory=working_directory, env=env, toolchain=toolchain, ttl_minutes=ttl_minutes,
-            idle_minutes=idle_minutes, retain_minutes=retain_minutes, label=label))
+            idle_minutes=idle_minutes, retain_minutes=retain_minutes, label=label,
+            webhook_url=webhook_url))
 
     @mcp.tool()
     async def wait_for_session(session_id: str, max_wait_seconds: int = 50) -> dict:

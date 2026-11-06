@@ -100,8 +100,11 @@ A single matching file is returned as-is (e.g. `app-debug.apk`); several are zip
 `android`, `kotlin`, `java`, `rust`, `go`, `python`, `node`, `cpp`, `flutter`, `generic`.
 See `get_build_presets`. Override anything with `build_command`, `artifact_paths`, `working_directory`
 (monorepos), `toolchain` (`java_version`, `node_version`, `python_version`, `go_version`), `env`
-(masked; use it for signing passwords) and `timeout_minutes`.
-Gradle, Cargo, Go, pip and npm caches persist between builds.
+(masked in logs; pass secrets such as signing passwords or API keys this way — enough for most cases)
+and `timeout_minutes`. Optional `webhook_url` (https) receives a JSON POST when the build finishes
+so agents need not poll.
+Gradle, Cargo, Go, pip, npm and Flutter caches persist between builds (within GitHub Actions cache
+limits; a cold runner still pays a startup cost).
 
 
 ## Session mode: a temporary remote shell (run tests, npm, gradlew, go build, ...)
