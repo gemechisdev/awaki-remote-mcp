@@ -71,9 +71,10 @@ PRESETS: dict[str, Preset] = {
     ),
     "flutter": Preset(
         "flutter",
-        "flutter pub get && flutter build apk --release",
+        "flutter create . --platforms=android && flutter pub get && flutter build apk --release",
         "build/app/outputs/flutter-apk/*.apk",
-        "Flutter stable + JDK 17.",
+        "Flutter stable + JDK 17. `flutter create .` keeps existing pubspec.yaml and lib/ — "
+        "do not add no-op cp of those files. Upload pubspec+lib only or a full scaffold; use --platforms=android when scaffolding on the runner.",
     ),
     "generic": Preset(
         "generic",

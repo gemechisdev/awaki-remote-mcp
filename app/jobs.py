@@ -611,7 +611,7 @@ class BuildService:
         if not files:
             return None
         note = ("url is a temporary signed link (no Bearer token needed). Download promptly.")
-        ttl = min(3600, self.s.artifact_ttl_minutes * 60)
+        ttl = min(self.s.download_url_ttl_seconds, self.s.artifact_ttl_minutes * 60)
 
         def _item(f: Path, multi: bool) -> dict:
             token_name = f.name if multi else "*"

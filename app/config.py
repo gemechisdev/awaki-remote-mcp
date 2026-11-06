@@ -142,6 +142,8 @@ class Settings:
     max_log_mb: int = 8
     max_artifact_mb: int = 200
     artifact_ttl_minutes: int = 180
+    download_url_ttl_seconds: int = 3600  # signed artifact URL lifetime
+    max_base64_upload_mb: int = 2  # MCP transit often truncates larger base64
     # Sessions (interactive "remote shell" mode)
     max_session_minutes: int = 180
     max_concurrent_sessions: int = 2
@@ -174,6 +176,8 @@ class Settings:
             max_log_mb=_int("MAX_LOG_MB", 8, 1, 50),
             max_artifact_mb=_int("MAX_ARTIFACT_MB", 200, 1, 2000),
             artifact_ttl_minutes=_int("ARTIFACT_TTL_MINUTES", 180, 5, 4320),
+            download_url_ttl_seconds=_int("DOWNLOAD_URL_TTL_SECONDS", 3600, 300, 86400),
+            max_base64_upload_mb=_int("MAX_BASE64_UPLOAD_MB", 2, 1, 30),
             max_session_minutes=_int("MAX_SESSION_MINUTES", 180, 10, 345),
             max_concurrent_sessions=_int("MAX_CONCURRENT_SESSIONS", 2, 1, 10),
             session_idle_minutes=_int("SESSION_IDLE_MINUTES", 30, 5, 240),

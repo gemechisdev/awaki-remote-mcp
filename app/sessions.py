@@ -366,7 +366,7 @@ class SessionService:
             return []
         retain = int((s["spec"] or {}).get("retain_minutes", 30))
         until = s["retain_until"] or (s["expires_at"] + retain * 60)
-        ttl = min(3600, retain * 60)
+        ttl = min(self.s.download_url_ttl_seconds, retain * 60)
         out = []
         for f in sorted(d.iterdir()):
             if not f.is_file() or f.name.endswith(".part"):

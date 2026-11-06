@@ -40,12 +40,13 @@ Two modes:
 • BUILD: source → submit_build → read_build_output or WebSocket /ws/builds/{id}/logs → download_artifact
 • SESSION: open_session → exec_command → pull_from_session (any file) → download_artifact(rs-…)
 
-Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
-Secrets only via env=. Languages: android kotlin java rust go python node cpp flutter generic.
-For HTTP upload/download and WebSocket logs: call create_access_token once, then use that Bearer
-(or ?token=) — never scrape the long-lived MCP secret. Artifacts also offer signed urls.
-Live logs: read_build_output (long-poll) or WebSocket via get_build_log_stream_url + access token.
-Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
+Source (exactly one): public git_url (preferred) or upload ZIP via binary POST /upload
+(create_access_token → Bearer). upload_source(base64) only for tiny zips — large base64 often
+truncates in MCP transit. Secrets via env=. Languages: android kotlin java rust go python node cpp flutter generic.
+HTTP/WS: create_access_token once; use that token (not the long-lived MCP secret). Artifacts: signed urls.
+Live logs: read_build_output or WebSocket (get_build_log_stream_url + access token).
+Flutter: flutter create . keeps existing pubspec/lib — no no-op cp. Sessions auto-expire.
+Commands start in project root; cd/export do not persist — chain with &&.
 """
 
 
@@ -252,18 +253,23 @@ def create_app(settings: Settings | None = None) -> Starlette:
         """How to obtain an upload_id (or skip upload entirely with a public git_url)."""
         base = (s.public_url or "").rstrip("/") or "https://YOUR-SERVICE"
         upload_url = f"{base}/upload"
+        b64_mb = min(s.max_base64_upload_mb, s.max_upload_mb)
         return {
-            "preferred": "public git_url → pass git_url= directly to submit_build / open_session (no upload).",
-            "pure_mcp": "upload_source(zip_base64=...) → returns upload_id. Soft limit ~30 MB decoded.",
+            "preferred": "public git_url → pass git_url= to submit_build / open_session (no upload).",
+            "primary_upload": "binary POST /upload (Bearer from create_access_token or MCP). Reliable for any size.",
+            "pure_mcp_base64": (
+                f"upload_source(zip_base64=...) only for tiny zips (≤{b64_mb} MB decoded). "
+                "MCP/tool transit often truncates larger base64 → BadZipFile; use binary POST instead."
+            ),
             "binary": {
                 "url": upload_url,
-                "auth": "Authorization: Bearer <MCP_API_TOKEN>",
+                "auth": "Authorization: Bearer <access_token from create_access_token>",
                 "raw": f"curl -sS -X POST '{upload_url}' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/zip' --data-binary @project.zip",
                 "multipart": f"curl -sS -X POST '{upload_url}' -H 'Authorization: Bearer <TOKEN>' -F 'file=@project.zip;type=application/zip'",
             },
             "limits": {
                 "max_upload_mb": s.max_upload_mb,
-                "max_base64_mb": min(30, s.max_upload_mb),
+                "max_base64_mb": b64_mb,
                 "tip": "Zip source only; exclude .git, node_modules, build/, .gradle, target/, .venv, secrets.",
             },
             "next": "submit_build(upload_id=...) or open_session(upload_id=...). On success use download_artifact.",
@@ -271,10 +277,11 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def upload_source(zip_base64: str) -> dict:
-        """Upload a project ZIP as base64 (pure MCP). Returns upload_id (expires after ~2 h) for submit_build / open_session.
+        """Upload a tiny project ZIP as base64 (pure MCP). Prefer binary POST /upload for anything non-trivial.
 
-        Soft limit ~30 MB decoded; larger projects → git_url or binary POST /upload.
-        Accepts optional data: URI prefix. Zip source only (exclude .git, node_modules, build caches).
+        Hard limit is small (see max_base64_upload_mb) because MCP transit often truncates larger base64
+        (BadZipFile / bad magic). For real projects: create_access_token → POST /upload, or use git_url.
+        Returns upload_id (expires ~2 h). Zip source only (no .git / node_modules / build caches).
         """
         # Strip optional data-URI prefix if an agent includes it
         raw = zip_base64.strip()
@@ -286,12 +293,17 @@ def create_app(settings: Settings | None = None) -> Starlette:
             raise ValueError(f"Invalid base64: {exc}") from None
         if not data:
             raise ValueError("Decoded ZIP is empty")
-        # Soft limit for base64 path (memory safety). Binary /upload still allows full max_upload_mb.
-        max_b64_mb = min(30, s.max_upload_mb)
+        max_b64_mb = min(s.max_base64_upload_mb, s.max_upload_mb)
         if len(data) > max_b64_mb * 1024 * 1024:
             raise ValueError(
-                f"Base64 upload exceeds {max_b64_mb} MB decoded. "
-                "Use a public git_url or POST the ZIP as binary to /upload instead."
+                f"Base64 upload exceeds {max_b64_mb} MB decoded (MCP transit is unreliable above this). "
+                "Call create_access_token, then POST the ZIP as binary to /upload, or use a public git_url."
+            )
+        # Detect truncated/corrupt zip early
+        if len(data) < 4 or data[:2] != b"PK":
+            raise ValueError(
+                "Decoded bytes are not a valid ZIP (missing PK header). "
+                "Likely base64 was truncated in transit — use binary POST /upload instead."
             )
 
         async def chunks() -> AsyncIterator[bytes]:
