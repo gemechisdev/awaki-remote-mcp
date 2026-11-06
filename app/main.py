@@ -36,7 +36,7 @@ INSTRUCTIONS = """\
 Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Reach for them when the work is heavier than your current environment — long compiles, Gradle/Android/Flutter, native builds, big test suites, or anything that needs more CPU/RAM/time.
 
 Two modes:
-• BUILD: source → submit_build → wait_for_build → download_artifact
+• BUILD: source → submit_build → read_build_output (live) / wait_for_build → download_artifact
 • SESSION: open_session → exec_command (+ read_output) → put_files / collect_artifacts → close_session
 
 Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
@@ -102,8 +102,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
         language: android|kotlin|java|rust|go|python|node|cpp|flutter|generic (preset fills command + artifact globs).
         Override with build_command / artifact_paths. working_directory for monorepos. env for secrets (masked).
         package: 'auto'|'zip'. return_artifacts defaults true (set false for test-only). webhook_url gets a finish POST.
+        Identical previous successful builds are reused automatically (cache_hit=true, no new runner).
         Example: language='android', upload_id='…', build_command='./gradlew assembleDebug'
-        Then wait_for_build → download_artifact.
+        Then read_build_output (live) / wait_for_build → download_artifact.
         """
         return await guard(svc.submit(
             language=language, upload_id=upload_id, git_url=git_url, git_ref=git_ref,
@@ -124,8 +125,21 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return await guard(svc.status(job_id))
 
     @mcp.tool()
+    async def read_build_output(job_id: str, offset: int = 0, wait_seconds: int = 25,
+                                max_chars: int = 30000, tail: bool = False) -> dict:
+        """Stream live build logs (long-poll). Same idea as session read_output.
+
+        Call while the build is running; pass next_offset from the previous response.
+        Returns as soon as there is new output, the build finishes, or wait_seconds elapses.
+        Prefer this over get_build_logs for long Android/Flutter/Gradle builds.
+        """
+        return await guard(svc.read_output(job_id, offset, max_chars, wait_seconds, tail))
+
+    @mcp.tool()
     async def get_build_logs(job_id: str, tail_lines: int = 200, errors_only: bool = False) -> dict:
-        """Post-build log: error_excerpt (key failures) + log_tail. Prefer errors_only=true to save tokens."""
+        """Post-build summary: error_excerpt (key failures) + log_tail. Prefer errors_only=true to save tokens.
+        While the build is still running use read_build_output instead.
+        """
         return await guard(svc.logs(job_id, tail_lines=tail_lines, errors_only=errors_only))
 
     @mcp.tool()
@@ -432,6 +446,15 @@ def create_app(settings: Settings | None = None) -> Starlette:
         svc.runner_complete(job_id, result, log)
         return JSONResponse({"ok": True})
 
+    async def runner_log(request: Request) -> JSONResponse:
+        """Live log chunks from the runner during a one-shot build (keeps GHA public log clean)."""
+        try:
+            job_id = _job(request)
+            data = await request.body()
+            return JSONResponse(svc.append_log(job_id, data))
+        except BuildError as exc:
+            return _bad(str(exc))
+
     # ------------------------------------------------------------- lifecycle
     async def bootstrap_loop() -> None:
         """Automatic setup: no shell needed. Runs at every start, retries until it works, re-verifies periodically."""
@@ -488,6 +511,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/runner/{job_id}/source", runner_source, methods=["GET"]),
         Route("/runner/{job_id}/artifact", runner_artifact, methods=["PUT", "POST"]),
         Route("/runner/{job_id}/complete", runner_complete, methods=["POST"]),
+        Route("/runner/{job_id}/log", runner_log, methods=["POST"]),
         *session_routes(sess),
         Mount("/", app=mcp.streamable_http_app()),
     ]

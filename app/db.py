@@ -25,9 +25,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     fetches     INTEGER NOT NULL DEFAULT 0,
     spec        TEXT NOT NULL DEFAULT '{}',
     result      TEXT,
-    error       TEXT
+    error       TEXT,
+    build_hash  TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS jobs_build_hash ON jobs(build_hash);
 CREATE TABLE IF NOT EXISTS sessions (
     session_id   TEXT PRIMARY KEY,
     created_at   REAL NOT NULL,
@@ -81,6 +83,15 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        # Soft migration for existing DBs (ephemeral hosts usually start empty)
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN build_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("CREATE INDEX IF NOT EXISTS jobs_build_hash ON jobs(build_hash)")
+        except sqlite3.OperationalError:
+            pass
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -98,12 +109,24 @@ class Database:
             return self._conn.execute(sql, args)
 
     # -- jobs --------------------------------------------------------------
-    def create_job(self, job_id: str, spec: dict, upload_id: str | None, state: str = "created") -> None:
+    def create_job(self, job_id: str, spec: dict, upload_id: str | None, state: str = "created",
+                   build_hash: str | None = None) -> None:
         now = time.time()
         self._exec(
-            "INSERT INTO jobs(job_id, created_at, updated_at, state, upload_id, spec) VALUES (?,?,?,?,?,?)",
-            (job_id, now, now, state, upload_id, json.dumps(spec)),
+            "INSERT INTO jobs(job_id, created_at, updated_at, state, upload_id, spec, build_hash) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (job_id, now, now, state, upload_id, json.dumps(spec), build_hash),
         )
+
+    def find_successful_by_hash(self, build_hash: str, max_age_s: float) -> dict | None:
+        """Most recent successful job with this build_hash whose artifact may still exist."""
+        cutoff = time.time() - max_age_s
+        row = self._exec(
+            "SELECT * FROM jobs WHERE build_hash=? AND state='completed' AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (build_hash, cutoff),
+        ).fetchone()
+        return self._row(row)
 
     def get_job(self, job_id: str) -> dict | None:
         return self._row(self._exec("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())

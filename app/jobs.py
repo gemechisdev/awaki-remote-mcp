@@ -287,6 +287,26 @@ class BuildService:
         if self.db.active_count(max_age_s=(self.s.max_build_minutes + 20) * 60) >= self.s.max_concurrent_builds:
             raise BuildError(f"{self.s.max_concurrent_builds} builds are already active; wait for one to finish")
 
+        # Content-addressed cache: identical source + command → reuse a recent successful artifact
+        build_hash = await self._compute_build_hash(
+            language=language, command=command, artifacts=art_lines, workdir=workdir,
+            env=clean_env, package=package, return_artifacts=bool(return_artifacts),
+            toolchain=tc, source=source, upload_id=upload_id,
+        )
+        cached = self.db.find_successful_by_hash(build_hash, self.s.artifact_ttl_minutes * 60)
+        if cached and bool(return_artifacts):
+            art = self.artifact_info(cached["job_id"])
+            res = cached.get("result") or {}
+            if art and res.get("ok"):
+                return {
+                    "job_id": cached["job_id"], "state": "succeeded", "cache_hit": True,
+                    "language": language, "label": (cached.get("spec") or {}).get("label") or language,
+                    "build_command": command, "artifact_paths": art_lines,
+                    "message": "Identical previous successful build reused (same source + command). "
+                               "No new runner was started.",
+                    "artifact": art,
+                }
+
         job_id = "rb-" + secrets.token_hex(8)
         spec = {
             "label": _clean_text(label or "", 80) or language,
@@ -305,7 +325,7 @@ class BuildService:
         }
         if webhook:
             spec["webhook_url"] = webhook
-        self.db.create_job(job_id, spec, upload_id)
+        self.db.create_job(job_id, spec, upload_id, build_hash=build_hash)
         try:
             run_id = await gh.dispatch(self.s.github_ref, {"job_id": job_id, "language": language, "mode": "build"})
             run_url = None
@@ -326,7 +346,7 @@ class BuildService:
         return {
             "job_id": job_id, "state": "queued", "language": language, "label": spec["label"],
             "build_command": command, "artifact_paths": art_lines, "timeout_minutes": timeout,
-            "run_url": run_url,
+            "run_url": run_url, "cache_hit": False,
             "next": "Call wait_for_build(job_id) until done=true; on success download the file with "
                     "GET /api/builds/{job_id}/artifact (or get_artifact_info); on failure call get_build_logs(job_id).",
         }
@@ -429,6 +449,57 @@ class BuildService:
             await asyncio.sleep(4)
 
     # ------------------------------------------------------------------- logs
+    def append_log(self, job_id: str, data: bytes) -> dict:
+        """Append a live log chunk from the runner. Creates the file if needed."""
+        self.check_job_id(job_id)
+        path = self.log_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cap = self.s.max_log_mb * 1024 * 1024
+        with path.open("ab") as fh:
+            size = path.stat().st_size if path.exists() else 0
+            if size >= cap:
+                return {"accepted": False, "reason": "log size limit reached", "size": size}
+            to_write = data[: max(0, cap - size)]
+            if to_write:
+                fh.write(to_write)
+            size = path.stat().st_size
+        return {"accepted": True, "size": size}
+
+    async def read_output(self, job_id: str, offset: int = 0, max_chars: int = 30000,
+                          wait_seconds: int = 25, tail: bool = False) -> dict:
+        """Long-poll for live (or finished) build log. Same shape as session read_output."""
+        self.check_job_id(job_id)
+        path = self.log_path(job_id)
+        deadline = time.time() + max(0, min(int(wait_seconds), 55))
+        while True:
+            view = await self.status(job_id)
+            size = path.stat().st_size if path.exists() else 0
+            finished = view["state"] in TERMINAL or view["state"] == "unknown"
+            if size > offset or finished or time.time() >= deadline:
+                break
+            await asyncio.sleep(1.0)
+        if not path.exists():
+            return {
+                "job_id": job_id, "state": view["state"], "finished": finished,
+                "output": "", "from_offset": offset, "next_offset": offset,
+                "total_bytes": 0, "message": "No log data yet (runner has not started streaming)."
+            }
+        data = await asyncio.to_thread(path.read_bytes)
+        if tail and len(data) > max_chars:
+            start = max(0, len(data) - max_chars)
+            chunk = data[start:]
+            skipped = True
+        else:
+            start = max(0, min(offset, len(data)))
+            chunk = data[start: start + max_chars]
+            skipped = start > 0 and offset > 0
+        return {
+            "job_id": job_id, "state": view["state"], "finished": finished,
+            "output": chunk.decode("utf-8", "replace"),
+            "from_offset": start, "next_offset": start + len(chunk),
+            "total_bytes": len(data), "earlier_output_skipped": skipped,
+        }
+
     async def logs(self, job_id: str, tail_lines: int = 200, max_chars: int = 20000, errors_only: bool = False) -> dict:
         self.check_job_id(job_id)
         view = await self.status(job_id)
@@ -436,7 +507,7 @@ class BuildService:
         out: dict[str, Any] = {"job_id": job_id, "state": view["state"]}
         if not path.exists():
             out["log_available"] = False
-            out["message"] = ("The build has not finished yet; logs are uploaded when the build ends."
+            out["message"] = ("No log data yet. While the build is running call read_build_output to stream it live."
                               if view["state"] in ("queued", "running", "unknown")
                               else "No log is stored (service restarted, or the build never started). "
                                    "Check run_url for the setup steps.")
@@ -551,10 +622,14 @@ class BuildService:
         clean = {k: v for k, v in result.items() if k in self._RESULT_KEYS}
         spec = {"label": clean.get("label"), "language": clean.get("language")}
         cap = self.s.max_log_mb * 1024 * 1024
-        if len(log) > cap:
-            log = b"[... earlier output truncated by the service ...]\n" + log[-cap:]
-        if log:
-            self.log_path(job_id).write_bytes(log)
+        path = self.log_path(job_id)
+        # Prefer the already-streamed live log if it is longer; otherwise write the final deliver log
+        existing = path.stat().st_size if path.exists() else 0
+        if log and len(log) > existing:
+            if len(log) > cap:
+                log = b"[... earlier output truncated by the service ...]\n" + log[-cap:]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(log)
         job = self.db.get_job(job_id)
         self.db.upsert_completed(job_id, clean, spec)
         self._release_source(job_id)
@@ -592,6 +667,57 @@ class BuildService:
                 await client.post(url, json=payload, headers={"User-Agent": "remote-build-mcp/webhook"})
         except Exception:
             pass  # best-effort; never fail the job because of the webhook
+
+    async def _compute_build_hash(self, *, language: str, command: str, artifacts: list[str],
+                                  workdir: str, env: dict, package: str, return_artifacts: bool,
+                                  toolchain: dict, source: dict, upload_id: str | None) -> str:
+        """Stable hash of everything that affects the build output. Used for cache hits."""
+        h = hashlib.sha256()
+        h.update(language.encode())
+        h.update(b"\0")
+        h.update(command.encode())
+        h.update(b"\0")
+        h.update("\n".join(artifacts).encode())
+        h.update(b"\0")
+        h.update(workdir.encode())
+        h.update(b"\0")
+        for k in sorted(env):
+            h.update(k.encode())
+            h.update(b"=")
+            h.update(env[k].encode())
+            h.update(b"\0")
+        h.update(package.encode())
+        h.update(b"\0")
+        h.update(b"1" if return_artifacts else b"0")
+        h.update(b"\0")
+        for k in sorted(toolchain):
+            h.update(k.encode())
+            h.update(b"=")
+            h.update(str(toolchain[k]).encode())
+            h.update(b"\0")
+        if source.get("type") == "git":
+            h.update(b"git:")
+            h.update(source.get("url", "").encode())
+            h.update(b"@")
+            h.update(source.get("ref", "").encode())
+        elif upload_id:
+            path = self.upload_path(upload_id)
+            if path.exists():
+                def _file_sha(p: Path) -> bytes:
+                    hh = hashlib.sha256()
+                    with p.open("rb") as f:
+                        while True:
+                            chunk = f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            hh.update(chunk)
+                    return hh.digest()
+                h.update(b"upload:")
+                h.update(await asyncio.to_thread(_file_sha, path))
+            else:
+                h.update(b"upload-missing:")
+                h.update(upload_id.encode())
+        return h.hexdigest()
 
     # --------------------------------------------------------------- cleanup
     def _release_source(self, job_id: str, force: bool = False) -> None:
