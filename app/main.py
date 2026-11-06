@@ -44,16 +44,19 @@ B) SESSION = temporary remote shell (open_session): run any commands (npm instal
 One-shot build steps:
 
 Workflow:
-1. Zip the project (exclude .git, node_modules, build outputs, secrets) and POST the ZIP to
+1. Get an upload_id (call get_upload_instructions for exact curl commands and the current upload URL).
+   Zip the project (exclude .git, node_modules, build outputs, secrets) and POST the ZIP to
    {upload_url} with header 'Authorization: Bearer <token>' (raw body or multipart field 'file').
-   The reply contains upload_id. Alternatively pass git_url for a PUBLIC https repository.
-2. Call submit_build(upload_id, language, ...). Presets supply a sensible build_command and
-   artifact_paths for android, kotlin, java, rust, go, python, node, cpp, flutter, generic.
+   The reply contains upload_id. Prefer a public git_url when the repo is public — no upload needed.
+2. Call submit_build(upload_id, language, ...) or submit_build(git_url=..., language=...).
+   Presets supply a sensible build_command and artifact_paths for android, kotlin, java, rust,
+   go, python, node, cpp, flutter, generic.
 3. Call wait_for_build(job_id) repeatedly until done=true. Builds take minutes; do other work meanwhile.
 4. On failure call get_build_logs(job_id): it returns an error_excerpt and the log tail. Fix the code, resubmit.
 5. On success download the artifact: GET {base}/api/builds/<job_id>/artifact with the same bearer token
    (one file as-is, or a ZIP when several files matched). It is kept for a few hours only.
 Do not put secrets in build_command; use the env parameter instead (values are masked in logs).
+Call get_upload_instructions any time you need the exact upload URL, curl examples, or alternatives.
 """
 
 
@@ -191,6 +194,96 @@ def create_app(settings: Settings | None = None) -> Starlette:
         """Supported languages with their default command, artifact globs and notes."""
         return {name: {"build_command": p.command, "artifact_paths": p.artifacts, "notes": p.description}
                 for name, p in PRESETS.items()}
+
+    @mcp.tool()
+    async def get_upload_instructions() -> dict:
+        """How to get an upload_id so you can call submit_build or open_session.
+
+        Call this first when you need to upload a project ZIP. Returns the exact
+        upload URL, ready-to-run curl commands, and alternative methods (public git_url).
+        Use the same Bearer token you already use for this MCP connection.
+        """
+        base = (s.public_url or "").rstrip("/") or "https://YOUR-SERVICE"
+        upload_url = f"{base}/upload"
+        return {
+            "upload_url": upload_url,
+            "auth_header": "Authorization: Bearer <your-MCP_API_TOKEN>",
+            "note": (
+                "Use the same Bearer token that authenticates this MCP connection. "
+                "Do not put the token in build_command or logs."
+            ),
+            "preferred_methods": [
+                {
+                    "name": "public_git_url",
+                    "when": "The project is already on a public HTTPS Git repository (GitHub/GitLab/Bitbucket).",
+                    "how": (
+                        "Skip the upload entirely. Call submit_build(language=..., git_url='https://...', "
+                        "git_ref='main') or open_session(..., git_url=...). No upload_id needed."
+                    ),
+                    "example": {
+                        "tool": "submit_build",
+                        "arguments": {
+                            "language": "android",
+                            "git_url": "https://github.com/owner/repo.git",
+                            "git_ref": "main",
+                        },
+                    },
+                },
+                {
+                    "name": "raw_zip_body",
+                    "when": "You can send a binary HTTP body (curl, most agent runtimes with binary support).",
+                    "how": (
+                        f"POST the ZIP bytes to {upload_url} with Content-Type: application/zip "
+                        "(or application/octet-stream). The JSON reply contains upload_id."
+                    ),
+                    "curl": (
+                        f"curl -sS -X POST '{upload_url}' \\\n"
+                        "  -H 'Authorization: Bearer <your-MCP_API_TOKEN>' \\\n"
+                        "  -H 'Content-Type: application/zip' \\\n"
+                        "  --data-binary @project.zip"
+                    ),
+                },
+                {
+                    "name": "multipart_form",
+                    "when": "Your HTTP client prefers multipart/form-data.",
+                    "how": (
+                        f"POST multipart to {upload_url} with the ZIP in the form field named 'file'."
+                    ),
+                    "curl": (
+                        f"curl -sS -X POST '{upload_url}' \\\n"
+                        "  -H 'Authorization: Bearer <your-MCP_API_TOKEN>' \\\n"
+                        "  -F 'file=@project.zip;type=application/zip'"
+                    ),
+                },
+            ],
+            "after_upload": {
+                "response_shape": {
+                    "upload_id": "string (use this in submit_build / open_session)",
+                    "size_bytes": "int",
+                    "expires_after_minutes": "int (typically 120)",
+                    "detected": "list of detected project types (android, python, ...)",
+                    "files": "int",
+                },
+                "next_step": (
+                    "Call submit_build(language='android', upload_id='<id>', ...) "
+                    "or open_session(upload_id='<id>', ...). "
+                    "Then use wait_for_build / wait_for_session as needed."
+                ),
+            },
+            "limits": {
+                "max_upload_mb": s.max_upload_mb,
+                "tip": (
+                    "Zip only the project source. Exclude .git, node_modules, build/, "
+                    ".gradle, target/, __pycache__, .venv, secrets, and large binaries."
+                ),
+            },
+            "troubleshooting": [
+                "401 Unauthorized → missing or wrong Authorization: Bearer header.",
+                "413 Payload Too Large → project exceeds max_upload_mb; remove build caches or use git_url.",
+                "400 'not a valid ZIP' → ensure the body is a real .zip (not a tar or directory listing).",
+                "If your agent runtime cannot send binary HTTP bodies, use a public git_url instead.",
+            ],
+        }
 
     register_session_tools(mcp, sess, guard, s.public_url)
 
