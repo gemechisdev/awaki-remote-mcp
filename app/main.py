@@ -33,31 +33,16 @@ from .sessions_http import register_session_tools, session_routes
 log = logging.getLogger("remote-build")
 
 INSTRUCTIONS = """\
-Remote build service on GitHub Actions (4 vCPU / 16 GB Linux runners), two modes:
+Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Reach for them whenever the work is heavier than your current environment — long compiles, Gradle/Android/Flutter, native builds, big test suites, or anything that needs more CPU/RAM/time.
 
-A) ONE-SHOT BUILD (submit_build): compile and get the artifact back. Steps below.
-B) SESSION = temporary remote shell (open_session): run any commands (npm install/build, gradlew, go build,
-   tests...) with live output, push updated code (put_files), pull outputs (collect_artifacts -> download URL),
-   then close_session. Typical flow: POST the project ZIP to {upload_url} (may include .env) -> open_session ->
-   exec_command (follow long ones with read_output) -> collect_artifacts -> close_session. Sessions and all their
-   data expire automatically. Each command starts in the project root; cd/export don't persist, chain with &&.
+Two modes:
+• BUILD (one-shot): source → submit_build → wait_for_build → download_artifact
+• SESSION (interactive shell): open_session → exec_command (+ read_output) → put_files / collect_artifacts → close_session
 
-One-shot build steps:
-
-Workflow:
-1. Get source into the service:
-   - Preferred: public git_url → skip upload.
-   - Or call upload_source(zip_base64=...) (pure MCP, no binary HTTP).
-   - Or POST the ZIP to {upload_url} (see get_upload_instructions for curl examples).
-2. Call submit_build(upload_id=... or git_url=..., language=...).
-   Presets supply a sensible build_command and artifact_paths for android, kotlin, java, rust,
-   go, python, node, cpp, flutter, generic.
-3. Call wait_for_build(job_id) repeatedly until done=true. Builds take minutes; do other work meanwhile.
-4. On failure call get_build_logs(job_id): it returns an error_excerpt and the log tail. Fix the code, resubmit.
-5. On success call download_artifact(job_id) (returns URL + optional base64) or GET the download URL
-   with the same bearer token. Artifacts are kept only a few hours.
-Do not put secrets in build_command; use the env parameter instead (values are masked in logs).
-Call get_upload_instructions any time you need the exact upload URL, curl examples, or alternatives.
+Source (exactly one): public git_url (preferred) or upload ZIP (upload_source for pure MCP, or POST /upload).
+Pass secrets only via env= (masked). Prefer webhook_url over polling.
+Presets: android, kotlin, java, rust, go, python, node, cpp, flutter, generic (see get_build_presets).
+Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
 """
 
 
@@ -81,8 +66,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
     # ------------------------------------------------------------------ MCP
     mcp = FastMCP(
         "Remote Build",
-        instructions=INSTRUCTIONS.format(upload_url=(s.public_url or "https://YOUR-SERVICE") + "/upload",
-                                       base=s.public_url or "https://YOUR-SERVICE"),
+        instructions=INSTRUCTIONS,
         stateless_http=True,
         json_response=True,
         streamable_http_path="/mcp",
@@ -113,20 +97,13 @@ def create_app(settings: Settings | None = None) -> Starlette:
         toolchain: dict[str, str] | None = None,
         webhook_url: str | None = None,
     ) -> dict:
-        """Start a remote build and return immediately with a job_id.
+        """Start a one-shot remote build on a 4 vCPU / 16 GB runner. Use for compiles, packaging, or tests that are slow or heavy on your current machine.
 
-        language: android | kotlin | java | rust | go | python | node | cpp | flutter | generic.
-        upload_id: from POST /upload (source ZIP). OR git_url (+git_ref): a public https repository.
-        build_command: optional for most languages (preset used); runs with bash in the project root.
-        artifact_paths: newline-separated globs relative to the project (supports **). Preset default per language.
-        working_directory: sub-folder to build in (monorepos). Artifact globs are relative to it.
-        env: extra environment variables for the build (values are masked in logs; use for signing passwords).
-        label: short name for this build, e.g. 'MyApp debug'.
-        package: 'auto' (a single matching file is returned as-is, several are zipped) or 'zip'.
-        return_artifacts: false = build/test only, no artifact is collected (artifact_paths not needed).
-        toolchain: optional {java_version, node_version, python_version, go_version}.
-        webhook_url: optional https URL; when the build finishes the service POSTs a small JSON
-            payload {event, job_id, state, ok, exit_code, ...} so you can avoid polling.
+        Source (exactly one): upload_id or public git_url (+ optional git_ref).
+        language picks a preset (command + artifact globs); override with build_command / artifact_paths.
+        working_directory for monorepos. env for secrets (masked). package: 'auto'|'zip'.
+        return_artifacts=false for test-only runs. webhook_url (https) gets a finish JSON POST.
+        Then wait_for_build or rely on the webhook; on success use download_artifact.
         """
         return await guard(svc.submit(
             language=language, upload_id=upload_id, git_url=git_url, git_ref=git_ref,
@@ -136,28 +113,24 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def wait_for_build(job_id: str, max_wait_seconds: int = 50) -> dict:
-        """Wait up to ~50 s for a build to finish. Returns done=true with the final state, or done=false (call again).
-
-        States: queued, running, succeeded, build_failed, delivery_failed, failed, timed_out, cancelled.
+        """Long-poll up to max_wait_seconds. Returns done=true + final state, or done=false (call again).
+        States: queued | running | succeeded | build_failed | delivery_failed | failed | timed_out | cancelled.
         """
         return await guard(svc.wait(job_id, max_wait_seconds))
 
     @mcp.tool()
     async def get_build_status(job_id: str) -> dict:
-        """Current state of a build; when finished, includes artifact {filename, size_bytes, download}."""
+        """Current build state. When finished, includes artifact {filename, size_bytes, download}."""
         return await guard(svc.status(job_id))
 
     @mcp.tool()
     async def get_build_logs(job_id: str, tail_lines: int = 200, errors_only: bool = False) -> dict:
-        """Build output for debugging: error_excerpt (key failure lines) and log_tail (last N lines).
-
-        Logs exist once the build has ended. Set errors_only=true to save tokens.
-        """
+        """Post-build log: error_excerpt (key failures) + log_tail. Prefer errors_only=true to save tokens."""
         return await guard(svc.logs(job_id, tail_lines=tail_lines, errors_only=errors_only))
 
     @mcp.tool()
     async def get_artifact_info(job_id: str) -> dict:
-        """Where to download a finished build's artifact (HTTP GET with the same bearer token)."""
+        """Download URL + metadata for a finished artifact (GET with the same Bearer token)."""
         info = svc.artifact_info(svc.check_job_id(job_id))
         if not info:
             raise ValueError("No artifact available (build not finished, failed, expired, or return_artifacts=false)")
@@ -170,23 +143,23 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def list_builds(limit: int = 20) -> list[dict]:
-        """Recent builds known to this service (newest first)."""
+        """Recent builds (newest first)."""
         return svc.list(limit)
 
     @mcp.tool()
     async def delete_build(job_id: str) -> dict:
-        """Forget a build and delete its stored log/source from this service (GitHub holds no source)."""
+        """Delete a build's stored log/source from this service."""
         return await guard(asyncio.to_thread(svc.delete, job_id))
 
     @mcp.tool()
     async def service_doctor() -> dict:
-        """Check this service's setup (runner repo, workflow files, secrets, public/private, config). Read-only."""
+        """Read-only health of runner repo, workflow files, secrets and config."""
         resp = await api_doctor(None)  # type: ignore[arg-type]
         return json.loads(resp.body)
 
     @mcp.tool()
     async def service_setup() -> dict:
-        """Re-run the automatic setup now (push workflow files and secrets to the runner repo). Safe to repeat."""
+        """Re-push workflow files and secrets to the runner repo. Safe to repeat."""
         resp = await api_bootstrap(None)  # type: ignore[arg-type]
         data = json.loads(resp.body)
         if "error" in data:
@@ -195,126 +168,38 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def get_build_presets() -> dict:
-        """Supported languages with their default command, artifact globs and notes."""
+        """Default build_command, artifact_paths and notes for each language."""
         return {name: {"build_command": p.command, "artifact_paths": p.artifacts, "notes": p.description}
                 for name, p in PRESETS.items()}
 
     @mcp.tool()
     async def get_upload_instructions() -> dict:
-        """How to get an upload_id so you can call submit_build or open_session.
-
-        Call this first when you need to upload a project ZIP. Returns the exact
-        upload URL, ready-to-run curl commands, MCP-native base64 upload, and
-        alternatives (public git_url). Use the same Bearer token you already use
-        for this MCP connection.
-        """
+        """How to obtain an upload_id (or skip upload entirely with a public git_url)."""
         base = (s.public_url or "").rstrip("/") or "https://YOUR-SERVICE"
         upload_url = f"{base}/upload"
         return {
-            "upload_url": upload_url,
-            "auth_header": "Authorization: Bearer <your-MCP_API_TOKEN>",
-            "note": (
-                "Use the same Bearer token that authenticates this MCP connection. "
-                "Do not put the token in build_command or logs."
-            ),
-            "preferred_methods": [
-                {
-                    "name": "public_git_url",
-                    "when": "The project is already on a public HTTPS Git repository (GitHub/GitLab/Bitbucket).",
-                    "how": (
-                        "Skip the upload entirely. Call submit_build(language=..., git_url='https://...', "
-                        "git_ref='main') or open_session(..., git_url=...). No upload_id needed."
-                    ),
-                    "example": {
-                        "tool": "submit_build",
-                        "arguments": {
-                            "language": "android",
-                            "git_url": "https://github.com/owner/repo.git",
-                            "git_ref": "main",
-                        },
-                    },
-                },
-                {
-                    "name": "mcp_base64",
-                    "when": "Your agent can only send JSON/text (no binary HTTP). Preferred pure-MCP path.",
-                    "how": (
-                        "Call the MCP tool upload_source(zip_base64='...') with the base64-encoded ZIP. "
-                        "It returns upload_id. Size limit is lower than the binary endpoint "
-                        f"(see max_base64_upload_mb). For larger projects prefer git_url or binary POST."
-                    ),
-                    "example": {
-                        "tool": "upload_source",
-                        "arguments": {"zip_base64": "<base64 of project.zip>"},
-                    },
-                },
-                {
-                    "name": "raw_zip_body",
-                    "when": "You can send a binary HTTP body (curl, most agent runtimes with binary support).",
-                    "how": (
-                        f"POST the ZIP bytes to {upload_url} with Content-Type: application/zip "
-                        "(or application/octet-stream). The JSON reply contains upload_id."
-                    ),
-                    "curl": (
-                        f"curl -sS -X POST '{upload_url}' \\\n"
-                        "  -H 'Authorization: Bearer <your-MCP_API_TOKEN>' \\\n"
-                        "  -H 'Content-Type: application/zip' \\\n"
-                        "  --data-binary @project.zip"
-                    ),
-                },
-                {
-                    "name": "multipart_form",
-                    "when": "Your HTTP client prefers multipart/form-data.",
-                    "how": (
-                        f"POST multipart to {upload_url} with the ZIP in the form field named 'file'."
-                    ),
-                    "curl": (
-                        f"curl -sS -X POST '{upload_url}' \\\n"
-                        "  -H 'Authorization: Bearer <your-MCP_API_TOKEN>' \\\n"
-                        "  -F 'file=@project.zip;type=application/zip'"
-                    ),
-                },
-            ],
-            "after_upload": {
-                "response_shape": {
-                    "upload_id": "string (use this in submit_build / open_session)",
-                    "size_bytes": "int",
-                    "expires_after_minutes": "int (typically 120)",
-                    "detected": "list of detected project types (android, python, ...)",
-                    "files": "int",
-                },
-                "next_step": (
-                    "Call submit_build(language='android', upload_id='<id>', ...) "
-                    "or open_session(upload_id='<id>', ...). "
-                    "Then use wait_for_build / wait_for_session as needed. "
-                    "When the build succeeds, call download_artifact(job_id) to retrieve the file."
-                ),
+            "preferred": "public git_url → pass git_url= directly to submit_build / open_session (no upload).",
+            "pure_mcp": "upload_source(zip_base64=...) → returns upload_id. Soft limit ~30 MB decoded.",
+            "binary": {
+                "url": upload_url,
+                "auth": "Authorization: Bearer <MCP_API_TOKEN>",
+                "raw": f"curl -sS -X POST '{upload_url}' -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/zip' --data-binary @project.zip",
+                "multipart": f"curl -sS -X POST '{upload_url}' -H 'Authorization: Bearer <TOKEN>' -F 'file=@project.zip;type=application/zip'",
             },
             "limits": {
                 "max_upload_mb": s.max_upload_mb,
-                "max_base64_upload_mb": min(30, s.max_upload_mb),
-                "tip": (
-                    "Zip only the project source. Exclude .git, node_modules, build/, "
-                    ".gradle, target/, __pycache__, .venv, secrets, and large binaries."
-                ),
+                "max_base64_mb": min(30, s.max_upload_mb),
+                "tip": "Zip source only; exclude .git, node_modules, build/, .gradle, target/, .venv, secrets.",
             },
-            "troubleshooting": [
-                "401 Unauthorized → missing or wrong Authorization: Bearer header.",
-                "413 Payload Too Large → project exceeds max_upload_mb; remove build caches or use git_url.",
-                "400 'not a valid ZIP' → ensure the body is a real .zip (not a tar or directory listing).",
-                "If your agent runtime cannot send binary HTTP bodies, use upload_source(zip_base64=...) or a public git_url.",
-            ],
+            "next": "submit_build(upload_id=...) or open_session(upload_id=...). On success use download_artifact.",
         }
 
     @mcp.tool()
     async def upload_source(zip_base64: str) -> dict:
-        """Upload a project ZIP via base64 and return an upload_id (pure MCP, no binary HTTP needed).
+        """Upload a project ZIP as base64 (pure MCP). Returns upload_id for submit_build / open_session.
 
-        Use this when your runtime cannot POST binary bodies. Encode the ZIP as standard base64
-        (no data: URI prefix). Soft limit ~30 MB decoded; for larger projects use a public git_url
-        or the binary POST /upload endpoint instead.
-
-        Returns the same shape as POST /upload: upload_id, size_bytes, detected language hints, etc.
-        Then call submit_build(upload_id=..., language=...) or open_session(upload_id=...).
+        Soft limit ~30 MB decoded. For larger projects prefer git_url or binary POST /upload.
+        Accepts optional data: URI prefix. Zip source only (no .git / node_modules / build caches).
         """
         # Strip optional data-URI prefix if an agent includes it
         raw = zip_base64.strip()
@@ -345,14 +230,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def download_artifact(job_id: str, as_base64: bool = False) -> dict:
-        """Retrieve a finished build's artifact.
+        """Get a finished artifact: always returns url + metadata. Optionally include base64 if ≤15 MB.
 
-        Always returns metadata + a download URL (GET with the same Bearer token).
-        If as_base64=true and the file is small enough (≤ 15 MB), also returns the
-        file content as base64 so the whole flow can stay inside MCP.
-
-        Prefer the URL for larger APKs/ZIPs; use as_base64 only when your runtime
-        cannot make a binary HTTP GET.
+        Prefer the URL (GET with same Bearer token) for large files; as_base64 only when binary HTTP is unavailable.
         """
         info = svc.artifact_info(svc.check_job_id(job_id))
         if not info:

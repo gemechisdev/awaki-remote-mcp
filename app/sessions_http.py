@@ -196,15 +196,12 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
         label: str | None = None,
         webhook_url: str | None = None,
     ) -> dict:
-        """Open a temporary remote shell on a GitHub Actions VM (4 vCPU / 16 GB, Ubuntu, sudo) with your project loaded.
+        """Open a temporary remote shell (4 vCPU / 16 GB, Ubuntu, sudo) with the project loaded.
 
-        Use for anything heavier than your own server can do: npm install/build, gradlew, go/cargo build, tests.
-        Source: upload_id (ZIP posted to /upload; may include .env files) OR git_url of a public https repo.
-        language picks preinstalled toolchains (android, kotlin, java, rust, go, python, node, cpp, flutter, generic).
-        ttl_minutes: hard lifetime (max 180). idle_minutes: auto-close when unused. retain_minutes: how long logs and
-        collected artifacts stay downloadable after the session ends. env: variables for every command.
-        webhook_url: optional https URL; when the session ends the service POSTs a small JSON payload.
-        The session closes itself and all its data is deleted automatically.
+        Reach for this when the work is heavier than your current environment: Gradle/Android/Flutter builds,
+        native compiles, large test suites, npm/cargo installs that take too long, or multi-step debugging.
+        Source: upload_id or public git_url. language selects toolchain. ttl/idle/retain control lifetime.
+        env applies to every command. webhook_url (https) gets a finish JSON POST. Auto-expires.
         """
         return await guard(svc.open(
             upload_id=upload_id, git_url=git_url, git_ref=git_ref, language=language,
@@ -214,12 +211,12 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
 
     @mcp.tool()
     async def wait_for_session(session_id: str, max_wait_seconds: int = 50) -> dict:
-        """Wait (up to ~50 s) until the session's runner is connected. ready=true means commands will start at once."""
+        """Wait until the runner is connected (ready=true) or max_wait_seconds elapses."""
         return await guard(svc.wait_ready(session_id, max_wait_seconds))
 
     @mcp.tool()
     async def session_status(session_id: str) -> dict:
-        """State (opening/ready/closing/closed/error/lost), time left, running commands, recent commands, artifacts."""
+        """State, time left, running/recent commands, and collected artifacts."""
         return await guard(svc.status(session_id))
 
     @mcp.tool()
@@ -231,51 +228,35 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
         timeout_seconds: int = 600,
         wait_seconds: int = 25,
     ) -> dict:
-        """Run a shell command (bash) in the session and return its output.
+        """Run a bash command on the remote machine. Returns output; if still running, state='running' + next_offset for read_output.
 
-        Waits up to wait_seconds; if the command is still running you get state='running' plus the output so far and
-        next_offset: call read_output(offset=next_offset, wait_seconds=25) to follow it live (like tail -f).
-        Each command starts in the project root (or cwd, relative); `cd`/`export` do not persist between commands, so
-        chain with && or pass cwd/env. Files, installed packages and caches DO persist. Commands can run concurrently
-        (e.g. a server in one, tests in another; redirect a server's output to a file). Long commands: raise
-        timeout_seconds. exit_code is the shell's exit status.
+        Starts in project root (or cwd). cd/export do not persist — chain with && or pass cwd/env.
+        Installed packages, build outputs and caches persist for the whole session. Concurrent commands allowed.
+        Raise timeout_seconds for long jobs (e.g. full Gradle assemble or cargo build).
         """
         return await guard(svc.exec(session_id, command, cwd, env, timeout_seconds, wait_seconds))
 
     @mcp.tool()
     async def read_output(session_id: str, cmd_id: str, offset: int = 0, wait_seconds: int = 25,
                           max_chars: int = 30000, tail: bool = False) -> dict:
-        """Read (and optionally wait for) more output of a command. Pass next_offset from the previous call.
-
-        Returns as soon as there is new output or the command finishes, or after wait_seconds. tail=true returns only the
-        last max_chars when the output is long.
-        """
+        """Follow command output (pass next_offset from previous call). Like tail -f with optional wait."""
         return await guard(svc.read_output(session_id, cmd_id, offset, max_chars, wait_seconds, tail))
 
     @mcp.tool()
     async def cancel_command(session_id: str, cmd_id: str) -> dict:
-        """Kill a running (or drop a queued) command."""
+        """Kill a running command or drop a queued one."""
         return await guard(svc.cancel_command(session_id, cmd_id))
 
     @mcp.tool()
     async def put_files(session_id: str, upload_id: str, dest: str | None = None, mode: str = "overlay",
                         keep: list[str] | None = None, wait_seconds: int = 120) -> dict:
-        """Send updated files into the running session (ZIP uploaded to /upload first).
-
-        mode='overlay' adds/overwrites files; mode='replace' wipes dest first except `keep` (default: node_modules,
-        .gradle, build, target, .cache, .venv, dist) so caches survive. dest is relative to the project root.
-        """
+        """Push a ZIP (already uploaded) into the session. overlay = add/overwrite; replace = wipe first (keeps caches)."""
         return await guard(svc.put(session_id, upload_id, dest, mode, keep, wait_seconds))
 
     @mcp.tool()
     async def collect_artifacts(session_id: str, paths: str, package: str = "auto", name: str | None = None,
                                 cwd: str | None = None, wait_seconds: int = 120) -> dict:
-        """Copy build outputs from the session to this service so you can download them by URL.
-
-        paths: newline-separated globs relative to the project (supports **), e.g. 'app/build/outputs/apk/**/*.apk'.
-        One matching file is stored as-is, several are zipped (package='zip' forces a zip). Download with
-        GET <this service>/api/sessions/<session_id>/artifacts/<name> using the same bearer token.
-        """
+        """Copy matching files (newline globs, supports **) from the session so they can be downloaded by URL."""
         return await guard(svc.collect(session_id, paths, package, name, cwd, wait_seconds))
 
     @mcp.tool()
@@ -286,23 +267,22 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
 
     @mcp.tool()
     async def get_session_log(session_id: str, max_chars: int = 20000) -> dict:
-        """Condensed transcript of the last commands (command, output tail, exit code)."""
+        """Condensed transcript of recent commands (command, output tail, exit code)."""
         return await guard(_ret(svc.transcript(session_id, max_chars)))
 
     @mcp.tool()
     async def close_session(session_id: str, retain_minutes: int | None = None) -> dict:
-        """End the session now (the VM and its workspace are destroyed). Logs and collected artifacts remain
-        downloadable for retain_minutes, then are deleted."""
+        """End the session (VM destroyed). Logs/artifacts remain for retain_minutes then delete."""
         return await guard(svc.close(session_id, retain_minutes))
 
     @mcp.tool()
     async def list_sessions(limit: int = 20) -> list[dict]:
-        """Recent sessions known to this service."""
+        """Recent sessions."""
         return svc.list(limit)
 
     @mcp.tool()
     async def delete_session(session_id: str) -> dict:
-        """End the session if open and delete all its logs and artifacts immediately."""
+        """Force-close and immediately wipe all logs and artifacts."""
         return await guard(svc.delete(session_id))
 
 
