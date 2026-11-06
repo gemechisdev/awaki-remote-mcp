@@ -24,12 +24,22 @@ from .db import Database
 from .github import GitHub, GitHubError
 from .jobs import BuildError, BuildService
 from .presets import PRESETS
+from .sessions import SessionService
+from .sessions_http import register_session_tools, session_routes
 
 log = logging.getLogger("remote-build")
 
 INSTRUCTIONS = """\
-Remote build service: compiles projects on GitHub Actions (4 vCPU / 16 GB Linux runners) and
-sends the finished artifact (APK, binary, wheel, ...) back to YOU, the server that called it.
+Remote build service on GitHub Actions (4 vCPU / 16 GB Linux runners), two modes:
+
+A) ONE-SHOT BUILD (submit_build): compile and get the artifact back. Steps below.
+B) SESSION = temporary remote shell (open_session): run any commands (npm install/build, gradlew, go build,
+   tests...) with live output, push updated code (put_files), pull outputs (collect_artifacts -> download URL),
+   then close_session. Typical flow: POST the project ZIP to {upload_url} (may include .env) -> open_session ->
+   exec_command (follow long ones with read_output) -> collect_artifacts -> close_session. Sessions and all their
+   data expire automatically. Each command starts in the project root; cd/export don't persist, chain with &&.
+
+One-shot build steps:
 
 Workflow:
 1. Zip the project (exclude .git, node_modules, build outputs, secrets) and POST the ZIP to
@@ -57,6 +67,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
     if s.github_token and s.github_repo:
         gh = GitHub(s.github_token, s.github_repo, s.github_api_url)
     svc = BuildService(s, db, gh)
+    sess = SessionService(s, db, gh, svc)
     sync_state: dict[str, Any] = {"status": "pending"}
 
     # ------------------------------------------------------------------ MCP
@@ -71,7 +82,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
-    async def guard(coro):
+    async def guard(coro):  # noqa: D401
         try:
             return await coro
         except (BuildError, GitHubError) as exc:
@@ -162,6 +173,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return {name: {"build_command": p.command, "artifact_paths": p.artifacts, "notes": p.description}
                 for name, p in PRESETS.items()}
 
+    register_session_tools(mcp, sess, guard, s.public_url)
+
     # ----------------------------------------------------------- plain routes
     async def health(request: Request) -> JSONResponse:
         problems = s.problems()
@@ -169,7 +182,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
                                 "configured": not problems}
         if request.scope.get("state", {}).get("authed"):
             body.update(problems=problems, runner_repo_sync=sync_state,
-                        active_builds=db.active_count((s.max_build_minutes + 20) * 60))
+                        active_builds=db.active_count((s.max_build_minutes + 20) * 60),
+                        active_sessions=db.count_active_sessions())
         return JSONResponse(body)
 
     async def upload(request: Request) -> JSONResponse:
@@ -342,6 +356,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/runner/{job_id}/source", runner_source, methods=["GET"]),
         Route("/runner/{job_id}/artifact", runner_artifact, methods=["PUT", "POST"]),
         Route("/runner/{job_id}/complete", runner_complete, methods=["POST"]),
+        *session_routes(sess),
         Mount("/", app=mcp.streamable_http_app()),
     ]
 
@@ -350,12 +365,22 @@ def create_app(settings: Settings | None = None) -> Starlette:
         problems = s.problems()
         if problems:
             log.warning("Configuration problems: %s", "; ".join(problems))
+        async def session_loop() -> None:
+            while True:
+                try:
+                    await sess.sweep()
+                except Exception:
+                    log.exception("session sweep failed")
+                await asyncio.sleep(20)
+
         task = asyncio.create_task(background())
+        task2 = asyncio.create_task(session_loop())
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
             task.cancel()
+            task2.cancel()
             if gh is not None:
                 await gh.aclose()
 

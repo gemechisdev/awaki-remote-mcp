@@ -28,6 +28,39 @@ CREATE TABLE IF NOT EXISTS jobs (
     error       TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id   TEXT PRIMARY KEY,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    state        TEXT NOT NULL,         -- opening | ready | closing | closed | error
+    upload_id    TEXT,
+    run_id       INTEGER,
+    run_url      TEXT,
+    spec         TEXT NOT NULL DEFAULT '{}',
+    expires_at   REAL NOT NULL,
+    last_activity REAL NOT NULL,
+    runner_seen  REAL,
+    closed_at    REAL,
+    retain_until REAL,
+    note         TEXT,
+    next_cmd     INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS commands (
+    session_id   TEXT NOT NULL,
+    cmd_id       TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    kind         TEXT NOT NULL,         -- exec | put | collect
+    payload      TEXT NOT NULL DEFAULT '{}',
+    state        TEXT NOT NULL,         -- queued | running | done | cancelled
+    exit_code    INTEGER,
+    timed_out    INTEGER NOT NULL DEFAULT 0,
+    cancel       INTEGER NOT NULL DEFAULT 0,
+    cancel_sent  INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL,
+    started_at   REAL,
+    finished_at  REAL,
+    PRIMARY KEY (session_id, cmd_id)
+);
 CREATE TABLE IF NOT EXISTS uploads (
     upload_id   TEXT PRIMARY KEY,
     created_at  REAL NOT NULL,
@@ -36,7 +69,7 @@ CREATE TABLE IF NOT EXISTS uploads (
 );
 """
 
-_JSON_COLS = {"spec", "result"}
+_JSON_COLS = {"spec", "result", "payload"}
 
 
 class Database:
@@ -122,6 +155,94 @@ class Database:
         self._exec("UPDATE jobs SET fetches = fetches + 1, updated_at=? WHERE job_id=?", (time.time(), job_id))
         job = self.get_job(job_id)
         return job["fetches"] if job else 0
+
+    # -- sessions ----------------------------------------------------------
+    def create_session(self, sid: str, spec: dict, upload_id: str | None, expires_at: float) -> None:
+        now = time.time()
+        self._exec(
+            "INSERT INTO sessions(session_id, created_at, updated_at, state, upload_id, spec, expires_at, last_activity)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (sid, now, now, "opening", upload_id, json.dumps(spec), expires_at, now),
+        )
+
+    def get_session(self, sid: str) -> dict | None:
+        return self._row(self._exec("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone())
+
+    def update_session(self, sid: str, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = time.time()
+        if "spec" in fields:
+            fields["spec"] = json.dumps(fields["spec"])
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self._exec(f"UPDATE sessions SET {cols} WHERE session_id=?", (*fields.values(), sid))
+
+    def sessions_in_states(self, states: tuple[str, ...]) -> list[dict]:
+        marks = ",".join("?" * len(states))
+        rows = self._exec(f"SELECT * FROM sessions WHERE state IN ({marks})", states).fetchall()
+        return [self._row(r) for r in rows]
+
+    def list_sessions(self, limit: int = 20) -> list[dict]:
+        rows = self._exec("SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._row(r) for r in rows]
+
+    def count_active_sessions(self) -> int:
+        return self._exec("SELECT COUNT(*) FROM sessions WHERE state IN ('opening','ready')").fetchone()[0]
+
+    def delete_session(self, sid: str) -> None:
+        with self._lock:
+            self._exec("DELETE FROM commands WHERE session_id=?", (sid,))
+            self._exec("DELETE FROM sessions WHERE session_id=?", (sid,))
+
+    def add_command(self, sid: str, kind: str, payload: dict, max_commands: int = 500) -> str | None:
+        with self._lock:
+            row = self._exec("SELECT next_cmd FROM sessions WHERE session_id=?", (sid,)).fetchone()
+            if not row or row[0] > max_commands:
+                return None
+            n = row[0]
+            cid = f"c{n}"
+            self._exec("UPDATE sessions SET next_cmd=?, last_activity=?, updated_at=? WHERE session_id=?",
+                       (n + 1, time.time(), time.time(), sid))
+            self._exec(
+                "INSERT INTO commands(session_id, cmd_id, seq, kind, payload, state, created_at) VALUES (?,?,?,?,?,?,?)",
+                (sid, cid, n, kind, json.dumps(payload), "queued", time.time()),
+            )
+            return cid
+
+    def get_command(self, sid: str, cid: str) -> dict | None:
+        return self._row(self._exec("SELECT * FROM commands WHERE session_id=? AND cmd_id=?", (sid, cid)).fetchone())
+
+    def list_commands(self, sid: str, limit: int = 200) -> list[dict]:
+        rows = self._exec("SELECT * FROM commands WHERE session_id=? ORDER BY seq DESC LIMIT ?", (sid, limit)).fetchall()
+        return [self._row(r) for r in reversed(rows)]
+
+    def update_command(self, sid: str, cid: str, **fields: Any) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self._exec(f"UPDATE commands SET {cols} WHERE session_id=? AND cmd_id=?", (*fields.values(), sid, cid))
+
+    def claim_next_command(self, sid: str) -> dict | None:
+        with self._lock:
+            row = self._exec(
+                "SELECT cmd_id FROM commands WHERE session_id=? AND state='queued' AND cancel=0 ORDER BY seq LIMIT 1",
+                (sid,)).fetchone()
+            if not row:
+                return None
+            self.update_command(sid, row[0], state="running", started_at=time.time())
+            return self.get_command(sid, row[0])
+
+    def pending_cancels(self, sid: str) -> list[str]:
+        rows = self._exec(
+            "SELECT cmd_id FROM commands WHERE session_id=? AND state='running' AND cancel=1 AND cancel_sent=0",
+            (sid,)).fetchall()
+        return [r[0] for r in rows]
+
+    def command_counts(self, sid: str) -> dict[str, int]:
+        rows = self._exec("SELECT state, COUNT(*) FROM commands WHERE session_id=? GROUP BY state", (sid,)).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def cancel_queued_commands(self, sid: str) -> None:
+        self._exec("UPDATE commands SET state='cancelled', finished_at=? WHERE session_id=? AND state='queued'",
+                   (time.time(), sid))
 
     # -- uploads -----------------------------------------------------------
     def add_upload(self, upload_id: str, size: int, info: dict) -> None:

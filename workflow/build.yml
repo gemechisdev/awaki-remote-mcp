@@ -1,6 +1,8 @@
 # Generic remote-build workflow. Contains no secrets and no project data.
 # The job spec (command, env, artifact globs) and the source are fetched from your service
-# at run time, and build output is never printed here, so a PUBLIC repo leaks nothing.
+# at run time, and build/command output is never printed here, so a PUBLIC repo leaks nothing.
+# mode=build   : run one build command, send the artifact + log back, finish.
+# mode=session : a temporary remote shell; commands arrive from your service and run on this VM.
 name: remote-build
 run-name: ${{ inputs.job_id }}
 
@@ -8,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: Opaque job id (rb-xxxxxxxxxxxxxxxx)
+        description: Opaque job or session id (rb-... / rs-...)
         required: true
         type: string
       language:
@@ -16,6 +18,11 @@ on:
         required: true
         type: string
         default: generic
+      mode:
+        description: build or session
+        required: false
+        type: string
+        default: build
 
 permissions:
   contents: read
@@ -23,6 +30,7 @@ permissions:
 env:
   RB_JOB_ID: ${{ inputs.job_id }}
   RB_LANGUAGE: ${{ inputs.language }}
+  RB_KIND: ${{ inputs.mode }}
 
 jobs:
   build:
@@ -132,12 +140,22 @@ jobs:
       # No secrets are available to this step or to anything the build command runs.
       - name: Build
         id: build
+        if: inputs.mode != 'session'
         timeout-minutes: ${{ fromJSON(steps.fetch.outputs.step_timeout) }}
         run: python3 _rb/.github/remote-build/runner.py build
 
       - name: Send artifact and logs to your service
-        if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
+        if: ${{ inputs.mode != 'session' && !cancelled() && steps.fetch.outcome == 'success' }}
         env:
           RB_SERVICE_URL: ${{ secrets.RB_SERVICE_URL }}
           RB_RUNNER_TOKEN: ${{ secrets.RB_RUNNER_TOKEN }}
         run: python3 _rb/.github/remote-build/runner.py deliver
+
+      # Interactive session. Only the service URL is present; the per-session token comes from a private file
+      # and the global runner token is NOT available while commands run.
+      - name: Interactive session
+        if: inputs.mode == 'session'
+        timeout-minutes: ${{ fromJSON(steps.fetch.outputs.step_timeout) }}
+        env:
+          RB_SERVICE_URL: ${{ secrets.RB_SERVICE_URL }}
+        run: python3 _rb/.github/remote-build/runner.py session

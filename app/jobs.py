@@ -57,6 +57,44 @@ def _safe_rel(path: str, what: str) -> str:
     return str(p)
 
 
+def validate_env(env: dict[str, str] | None) -> dict[str, str]:
+    clean: dict[str, str] = {}
+    for key, value in (env or {}).items():
+        if not _ENV_KEY_RE.fullmatch(str(key)) or str(key).upper().startswith(_RESERVED_ENV):
+            raise BuildError(f"Invalid or reserved environment variable name: {key!r}")
+        if len(str(value)) > 4096:
+            raise BuildError(f"Environment variable {key} is too long")
+        clean[str(key)] = str(value)
+    if len(clean) > 50:
+        raise BuildError("At most 50 environment variables")
+    return clean
+
+
+def validate_toolchain(toolchain: dict[str, str] | None) -> dict[str, str]:
+    tc = dict(TOOLCHAIN_DEFAULTS)
+    for key, value in (toolchain or {}).items():
+        if key not in TOOLCHAIN_KEYS or not _VERSION_RE.fullmatch(str(value)):
+            raise BuildError(f"toolchain supports only {sorted(TOOLCHAIN_KEYS)} with simple version strings")
+        tc[key] = str(value)
+    return tc
+
+
+def validate_workdir(working_directory: str | None) -> str:
+    if working_directory and working_directory.strip("./ "):
+        if not _WORKDIR_RE.fullmatch(working_directory):
+            raise BuildError("working_directory contains unsupported characters")
+        return _safe_rel(working_directory.strip(), "working_directory")
+    return ""
+
+
+def validate_git(git_url: str | None, git_ref: str | None) -> dict:
+    if not _GIT_URL_RE.fullmatch(git_url or ""):
+        raise BuildError("git_url must be a plain https URL without credentials or query string")
+    if git_ref and not _REF_RE.fullmatch(git_ref):
+        raise BuildError("Invalid git_ref")
+    return {"type": "git", "url": git_url, "ref": git_ref or ""}
+
+
 def result_state(res: dict) -> tuple[str, str]:
     """Map the runner's result into (state, human detail)."""
     if res.get("ok"):
@@ -248,7 +286,7 @@ class BuildService:
         }
         self.db.create_job(job_id, spec, upload_id)
         try:
-            run_id = await gh.dispatch(self.s.github_ref, {"job_id": job_id, "language": language})
+            run_id = await gh.dispatch(self.s.github_ref, {"job_id": job_id, "language": language, "mode": "build"})
             run_url = None
             if run_id is None:  # older API behaviour: locate the run by its run-name
                 for _ in range(5):

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import Settings
+from .config import Settings, derive_session_token
 
 
 def tokens_equal(supplied: str, expected: str) -> bool:
@@ -33,6 +33,7 @@ class AuthMiddleware:
 
     * ``/health``            open (details only for authenticated callers)
     * ``/runner/*``          runner token (given to GitHub as an encrypted secret)
+    * ``/srunner/<sid>/*``   per-session token derived from the runner token
     * everything else        MCP_API_TOKEN
     Repeated failures from one client IP are throttled.
     """
@@ -72,7 +73,14 @@ class AuthMiddleware:
                                 headers={"Retry-After": "300"})
             await resp(scope, receive, send)
             return
-        expected = self.settings.runner_token if path.startswith("/runner/") else self.settings.mcp_api_token
+        if path.startswith("/srunner/"):  # interactive session runner: per-session token
+            parts = path.split("/")
+            sid = parts[2] if len(parts) > 2 else ""
+            expected = derive_session_token(self.settings.runner_token, sid) if sid and self.settings.runner_token else ""
+        elif path.startswith("/runner/"):
+            expected = self.settings.runner_token
+        else:
+            expected = self.settings.mcp_api_token
         if not tokens_equal(bearer(headers), expected):
             self._fails[who].append(time.time())
             resp = JSONResponse({"error": "Unauthorized"}, status_code=401,

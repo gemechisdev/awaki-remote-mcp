@@ -31,6 +31,15 @@ def derive_runner_token(mcp_api_token: str) -> str:
     return hmac.new(mcp_api_token.encode(), b"remote-build-mcp/runner/v1", hashlib.sha256).hexdigest()
 
 
+def derive_session_token(runner_token: str, session_id: str) -> str:
+    """Per-session token (stateless: recomputed on every request, survives service restarts).
+
+    Only this value is available to the interactive session on the runner; the global runner
+    token is used just once, by the fetch step, and is not present while your commands run.
+    """
+    return hmac.new(runner_token.encode(), f"session:{session_id}".encode(), hashlib.sha256).hexdigest()
+
+
 def _public_url() -> str:
     url = os.getenv("PUBLIC_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
     if not url and os.getenv("KOYEB_PUBLIC_DOMAIN"):
@@ -60,6 +69,13 @@ class Settings:
     max_log_mb: int = 8
     max_artifact_mb: int = 200
     artifact_ttl_minutes: int = 180
+    # Sessions (interactive "remote shell" mode)
+    max_session_minutes: int = 180
+    max_concurrent_sessions: int = 2
+    session_idle_minutes: int = 30
+    session_retain_minutes: int = 30
+    max_cmd_log_mb: int = 20
+    max_session_artifact_mb: int = 500
     # Behaviour
     sync_runner_repo: bool = True
 
@@ -85,6 +101,12 @@ class Settings:
             max_log_mb=_int("MAX_LOG_MB", 8, 1, 50),
             max_artifact_mb=_int("MAX_ARTIFACT_MB", 200, 1, 2000),
             artifact_ttl_minutes=_int("ARTIFACT_TTL_MINUTES", 180, 5, 4320),
+            max_session_minutes=_int("MAX_SESSION_MINUTES", 180, 10, 345),
+            max_concurrent_sessions=_int("MAX_CONCURRENT_SESSIONS", 2, 1, 10),
+            session_idle_minutes=_int("SESSION_IDLE_MINUTES", 30, 5, 240),
+            session_retain_minutes=_int("SESSION_RETAIN_MINUTES", 30, 1, 1440),
+            max_cmd_log_mb=_int("MAX_CMD_LOG_MB", 20, 1, 200),
+            max_session_artifact_mb=_int("MAX_SESSION_ARTIFACT_MB", 500, 10, 5000),
             sync_runner_repo=os.getenv("SYNC_RUNNER_REPO", "true").strip().lower() not in {"0", "false", "no"},
         )
 

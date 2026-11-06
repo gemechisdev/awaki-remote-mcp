@@ -1,5 +1,7 @@
 # Remote Build MCP
 
+Two modes on one free setup: **one-shot builds** and **temporary remote-shell sessions**.
+
 Give your AI agent a big build machine for free. Your agent (on a tiny Koyeb/Render box) uploads
 its project, this service runs the build on **GitHub Actions** (4 vCPU / 16 GB), and the finished
 file (APK, binary, wheel, ZIP) **comes back to your server** that called it.
@@ -83,6 +85,8 @@ python client/rb.py build --dir ./my-android-app --language android --out ./out
 | `get_artifact_info` | Download URL, size, expiry |
 | `cancel_build`, `list_builds`, `delete_build`, `get_build_presets` | housekeeping |
 
+(One-shot build tools. Session tools are described in the next section.)
+
 The agent uploads source with `POST /upload` (raw ZIP body or multipart `file`), then passes `upload_id`.
 Alternatively `git_url` clones a **public** https repo on the runner.
 Download the result with `GET /api/builds/<job_id>/artifact` (same bearer token).
@@ -96,6 +100,63 @@ See `get_build_presets`. Override anything with `build_command`, `artifact_paths
 (monorepos), `toolchain` (`java_version`, `node_version`, `python_version`, `go_version`), `env`
 (masked; use it for signing passwords) and `timeout_minutes`.
 Gradle, Cargo, Go, pip and npm caches persist between builds.
+
+
+## Session mode: a temporary remote shell (run tests, npm, gradlew, go build, ...)
+
+For "run these commands on a better machine for a while": open a session, run as many commands as you like with
+**live output**, push updated code, pull outputs, close. Your own server stays light; the work happens on a
+GitHub VM (4 vCPU / 16 GB, Ubuntu, sudo).
+
+```
+agent ──ZIP──▶ service ──dispatch──▶ GitHub job (the "session")
+agent ──exec "gradlew assembleDebug"──▶ service ◀──long-poll for commands── runner (executes, streams output)
+agent ◀──read_output (live, ~1 s chunks)── service ◀──────────────────────── runner
+agent ◀──download URL── service ◀──collected artifacts / logs ───────────── runner
+```
+
+The runner connects **out** to your service (GitHub runners accept no inbound traffic) and polls for work, so no tunnels
+or SSH are involved. While a session is open the traffic also keeps a free-tier host awake.
+
+### From a shell (Claude Code, Cursor, your own scripts) - `client/rb.py`
+```bash
+export RB_URL=https://YOUR-SERVICE RB_TOKEN=<MCP_API_TOKEN>
+python client/rb.py open --dir ./my-app --language android --include-env   # zips + uploads, starts the VM (~1 min)
+python client/rb.py exec "./gradlew assembleDebug"                          # output streams live; exit code is passed through
+python client/rb.py exec "npm ci && npm test"
+python client/rb.py put --dir ./my-app --mode replace                       # push edited code, keep node_modules/.gradle caches
+python client/rb.py pull "app/build/outputs/apk/**/*.apk" --out ./out       # collect + download
+python client/rb.py close
+```
+`--include-env` also uploads `.env` files and keystores (excluded by default). The session id is stored in `./.rb-session`.
+
+### From an MCP client
+`open_session` -> `exec_command` (returns output; if still running, follow it with `read_output(offset=next_offset)`,
+like `tail -f`) -> `put_files` / `collect_artifacts` -> `close_session`. Also `wait_for_session`, `session_status`,
+`cancel_command`, `get_session_log`, `list_session_artifacts`, `list_sessions`, `delete_session`.
+Collected files are downloaded with `GET /api/sessions/<id>/artifacts/<name>` (bearer token). The agent uploads the
+ZIP with `POST /upload` first (same as builds) or uses `git_url` for a public repo.
+
+### How it behaves
+- Each command starts in the project root (or `cwd`) in a fresh `bash`: `cd` and `export` do **not** persist, so chain with
+  `&&` or pass `cwd`/`env`. Installed packages, build outputs and caches **do** persist for the whole session.
+- Commands can run concurrently (e.g. a dev server in one, tests in another); for servers redirect output to a file and
+  use a large `timeout_seconds`. Cancel any command with `cancel_command`.
+- Not a TTY: interactive programs (vim, REPL prompts) are not supported.
+- **Everything is temporary.** Hard lifetime `ttl_minutes` (default 60, max 180), auto-close after `idle_minutes` (default 30)
+  without commands, then logs and collected artifacts stay for `retain_minutes` (default 30) and are deleted
+  automatically; the GitHub job is cancelled and the VM disappears. `delete_session` wipes it all immediately.
+- Updating code: `put_files` with `mode=overlay` (add/overwrite) or `replace` (wipe first, keeping
+  `node_modules, .gradle, build, target, .cache, .venv, dist` unless you pass `keep`).
+- Limits (env vars): `MAX_SESSION_MINUTES`, `MAX_CONCURRENT_SESSIONS` (2), `MAX_CMD_LOG_MB` (20 per command),
+  `MAX_SESSION_ARTIFACT_MB` (500), `MAX_ARTIFACT_MB` (200 per file).
+
+### Session security
+- Your code and command output never go into the public repo or its log; commands arrive from your service.
+- The global runner token exists only in the first (fetch) step. During the session the runner holds a **per-session
+  token** that works for that one session only and dies with it. Commands you run *can* read that token (and have
+  `sudo`), which is why it is scoped so narrowly. Do not put real production secrets in sessions you don't trust.
+- `.env` and other env values are sent only if you include them.
 
 ## Reliability notes
 
@@ -120,10 +181,10 @@ every build parameter, secrets scoped to only the two steps that need them, mini
 ## Layout
 
 ```
-app/        service (MCP + REST + runner endpoints), GitHub client, bootstrap/doctor CLI
-runner/     runner.py  - executed on GitHub (fetch / build / deliver), stdlib only
+app/        service (MCP + REST + runner endpoints), builds + sessions, GitHub client, bootstrap/doctor CLI
+runner/     runner.py  - executed on GitHub (fetch / build / deliver / session), stdlib only
 workflow/   build.yml  - the generic workflow pushed to the runner repo
-client/     rb.py      - agent-side helper (zip, upload, wait, download)
+client/     rb.py      - agent-side helper (builds and live sessions)
 ```
 
 Run locally: `uvicorn --factory app.main:create_app --port 8000` (note `--factory`).
