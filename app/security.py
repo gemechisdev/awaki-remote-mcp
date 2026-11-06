@@ -59,26 +59,40 @@ class AuthMiddleware:
         return len(q) >= 20
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
         path: str = scope["path"]
-        headers = {k.decode().lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        if path == "/health":
+        headers = {k.decode().lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        qs = scope.get("query_string", b"")
+        if scope["type"] == "http" and path == "/health":
             scope["state"] = {**scope.get("state", {}), "authed": tokens_equal(bearer(headers), self.settings.mcp_api_token)}
             await self.app(scope, receive, send)
             return
         who = self._client(scope, headers)
         if self._blocked(who):
-            resp = JSONResponse({"error": "Too many failed authentication attempts"}, status_code=429,
-                                headers={"Retry-After": "300"})
-            await resp(scope, receive, send)
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 4401})
+            else:
+                resp = JSONResponse({"error": "Too many failed authentication attempts"}, status_code=429,
+                                    headers={"Retry-After": "300"})
+                await resp(scope, receive, send)
             return
-        # Temporary download tokens: agents get a signed URL without the long-lived MCP token
-        if self._allow_download_token(path, scope.get("query_string", b"")):
+        # Temporary download tokens (HTTP artifact GETs)
+        if scope["type"] == "http" and self._allow_download_token(path, qs):
             await self.app(scope, receive, send)
             return
-        if path.startswith("/srunner/"):  # interactive session runner: per-session token
+        # WebSocket live logs: /ws/... ?token=<MCP_API_TOKEN>
+        if scope["type"] == "websocket" and path.startswith("/ws/"):
+            params = parse_qs(qs.decode("latin-1", "replace"))
+            tok = (params.get("token") or [""])[0] or bearer(headers)
+            if tokens_equal(tok, self.settings.mcp_api_token):
+                await self.app(scope, receive, send)
+                return
+            self._fails[who].append(time.time())
+            await send({"type": "websocket.close", "code": 4401})
+            return
+        if path.startswith("/srunner/"):
             parts = path.split("/")
             sid = parts[2] if len(parts) > 2 else ""
             expected = derive_session_token(self.settings.runner_token, sid) if sid and self.settings.runner_token else ""
@@ -88,9 +102,12 @@ class AuthMiddleware:
             expected = self.settings.mcp_api_token
         if not tokens_equal(bearer(headers), expected):
             self._fails[who].append(time.time())
-            resp = JSONResponse({"error": "Unauthorized"}, status_code=401,
-                                headers={"WWW-Authenticate": "Bearer"})
-            await resp(scope, receive, send)
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 4401})
+            else:
+                resp = JSONResponse({"error": "Unauthorized"}, status_code=401,
+                                    headers={"WWW-Authenticate": "Bearer"})
+                await resp(scope, receive, send)
             return
         await self.app(scope, receive, send)
 

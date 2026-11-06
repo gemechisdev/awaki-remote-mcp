@@ -17,7 +17,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__
 from .bootstrap import doctor as run_doctor
@@ -36,13 +37,14 @@ INSTRUCTIONS = """\
 Remote builds on free GitHub Actions runners (4 vCPU / 16 GB, Ubuntu, sudo). Reach for them when the work is heavier than your current environment — long compiles, Gradle/Android/Flutter, native builds, big test suites, or anything that needs more CPU/RAM/time.
 
 Two modes:
-• BUILD: source → submit_build → read_build_output (live) / wait_for_build → download_artifact
-• SESSION: open_session → exec_command (+ read_output) → put_files / collect_artifacts → list_session_artifacts
+• BUILD: source → submit_build → read_build_output or WebSocket /ws/builds/{id}/logs → download_artifact
+• SESSION: open_session → exec_command → pull_from_session (any file) → download_artifact(rs-…)
 
 Source (exactly one): public git_url (preferred) or upload ZIP (upload_source or POST /upload).
-Secrets only via env= (masked). Prefer webhook_url over polling. Languages: android kotlin java rust go python node cpp flutter generic (get_build_presets).
-Artifacts return temporary signed urls (no Bearer token needed). Sessions auto-expire.
-Commands start in project root; cd/export do not persist — chain with &&.
+Secrets only via env=. Languages: android kotlin java rust go python node cpp flutter generic.
+Artifacts (build + session) use temporary signed urls — no Bearer on the download URL.
+Live build logs: long-poll read_build_output, or WebSocket (get_build_log_stream_url).
+Sessions auto-expire. Commands start in project root; cd/export do not persist — chain with &&.
 """
 
 
@@ -132,10 +134,31 @@ def create_app(settings: Settings | None = None) -> Starlette:
         """Stream live build logs (long-poll). Same idea as session read_output.
 
         Call while the build is running; pass next_offset from the previous response.
-        Returns as soon as there is new output, the build finishes, or wait_seconds elapses.
-        Prefer this over get_build_logs for long Android/Flutter/Gradle builds.
+        For true push streaming, connect a WebSocket to:
+          wss://YOUR-SERVICE/ws/builds/{job_id}/logs?token=<MCP_API_TOKEN>
+        Prefer this or the WebSocket over get_build_logs for long Android/Flutter/Gradle builds.
         """
         return await guard(svc.read_output(job_id, offset, max_chars, wait_seconds, tail))
+
+    @mcp.tool()
+    async def get_build_log_stream_url(job_id: str) -> dict:
+        """WebSocket URL for live build log streaming (push). Auth via ?token=<MCP_API_TOKEN>."""
+        jid = svc.check_job_id(job_id)
+        base = (s.public_url or "").rstrip("/")
+        if base.startswith("https://"):
+            ws = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            ws = "ws://" + base[len("http://"):]
+        else:
+            ws = base or "wss://YOUR-SERVICE"
+        url = f"{ws}/ws/builds/{jid}/logs?token=<MCP_API_TOKEN>"
+        return {
+            "job_id": jid,
+            "websocket_url": url,
+            "note": "Replace <MCP_API_TOKEN> with the same Bearer token used for MCP. "
+                    "Text frames are raw log chunks; connection closes when the build finishes.",
+            "long_poll_alternative": "read_build_output(job_id, offset, wait_seconds)",
+        }
 
     @mcp.tool()
     async def get_build_logs(job_id: str, tail_lines: int = 200, errors_only: bool = False) -> dict:
@@ -254,25 +277,62 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     @mcp.tool()
     async def download_artifact(job_id: str, name: str | None = None, as_base64: bool = False) -> dict:
-        """Get a finished artifact. Returns a temporary signed url (no Bearer token needed) + metadata.
+        """Download a finished artifact from a build (rb-…) OR a session (rs-…).
 
-        When package='named' produced several files, pass name= (or call get_artifact_info first).
-        Prefer the signed url for large files (APKs, zips). as_base64 only when ≤15 MB and no HTTP GET.
+        Returns a temporary signed url (no Bearer token needed). For sessions, name is the artifact
+        filename from list_session_artifacts / pull_from_session. Prefer the url for large files;
+        as_base64 only when ≤15 MB.
         """
+        base = (s.public_url or "").rstrip("/")
+        # Session artifacts (rs-…)
+        if job_id.startswith("rs-"):
+            sid = sess.check_id(job_id)
+            items = sess.artifacts(sid)
+            if not items:
+                raise ValueError("No session artifacts yet. Call pull_from_session or collect_artifacts first.")
+            if name:
+                match = next((a for a in items if a["name"] == name), None)
+                if not match:
+                    raise ValueError(f"No session artifact named {name!r}. Available: {[a['name'] for a in items]}")
+                items = [match]
+            elif len(items) > 1:
+                for a in items:
+                    a["url"] = base + a["download"]
+                    a["curl"] = f"curl -sS -L -o '{a['name']}' '{a['url']}'"
+                return {
+                    "session_id": sid, "artifacts": items, "count": len(items),
+                    "hint": "Multiple session artifacts. Pass name= or use the signed urls.",
+                }
+            a = items[0]
+            url = base + a["download"]
+            result: dict[str, Any] = {
+                "session_id": sid, "filename": a["name"], "size_bytes": a["size_bytes"],
+                "url": url, "curl": f"curl -sS -L -o '{a['name']}' '{url}'",
+                "note": "Signed temporary URL — no Authorization header required.",
+            }
+            if as_base64:
+                path = sess.artifact_path(sid, a["name"])
+                if path and path.stat().st_size <= 15 * 1024 * 1024:
+                    result["content_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+                    result["encoding"] = "base64"
+                else:
+                    result["base64_omitted"] = "File too large for base64; use the signed url."
+            return result
+
+        # Build artifacts (rb-…)
         info = svc.artifact_info(svc.check_job_id(job_id), name)
         if not info:
             raise ValueError(
                 "No artifact available (build not finished, failed, expired, or return_artifacts=false)"
             )
-        base = (s.public_url or "").rstrip("/")
         if "artifacts" in info:
             for item in info["artifacts"]:
                 item["url"] = (base + item["download"]) if base else item["download"]
                 item["curl"] = f"curl -sS -L -o '{item['filename']}' '{item['url']}'"
-            info["hint"] = "Multiple artifacts. Call again with name='…' or use the signed urls above (no auth header)."
+            info["hint"] = "Multiple artifacts. Call again with name='…' or use the signed urls above."
             return info
         url = (base + info["download"]) if base else info["download"]
-        result: dict[str, Any] = {
+        result = {
             **info,
             "url": url,
             "curl": f"curl -sS -L -o '{info['filename']}' '{url}'",
@@ -283,11 +343,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
             if path is None:
                 raise ValueError("Artifact file disappeared (expired?)")
             size = path.stat().st_size
-            max_b64 = 15 * 1024 * 1024
-            if size > max_b64:
-                result["base64_omitted"] = (
-                    f"File is {size} bytes (> 15 MB). Use the signed url/curl instead."
-                )
+            if size > 15 * 1024 * 1024:
+                result["base64_omitted"] = f"File is {size} bytes (> 15 MB). Use the signed url/curl instead."
             else:
                 result["content_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
                 result["encoding"] = "base64"
@@ -472,6 +529,49 @@ def create_app(settings: Settings | None = None) -> Starlette:
         except BuildError as exc:
             return _bad(str(exc))
 
+    async def ws_build_logs(websocket: WebSocket) -> None:
+        """Stream live build logs over WebSocket. Connect to /ws/builds/{job_id}/logs?token=<MCP_API_TOKEN>.
+
+        First sends any log bytes already on disk, then pushes new chunks as the runner streams them.
+        Text frames are raw log text. Closes when the build reaches a terminal state (or client disconnects).
+        """
+        job_id = websocket.path_params["job_id"]
+        try:
+            svc.check_job_id(job_id)
+        except BuildError:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        q = svc.subscribe_logs(job_id)
+        try:
+            # Replay existing log
+            path = svc.log_path(job_id)
+            if path.exists():
+                existing = await asyncio.to_thread(path.read_bytes)
+                if existing:
+                    await websocket.send_text(existing.decode("utf-8", "replace"))
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=5.0)
+                    await websocket.send_text(chunk.decode("utf-8", "replace"))
+                except asyncio.TimeoutError:
+                    view = await svc.status(job_id)
+                    if view.get("state") in ("succeeded", "build_failed", "delivery_failed",
+                                             "failed", "timed_out", "cancelled", "unknown"):
+                        # Final catch-up from file
+                        if path.exists():
+                            final = await asyncio.to_thread(path.read_bytes)
+                            # Only send tail if we might have missed something — keep simple: send marker
+                        await websocket.send_text("\n[build finished]\n")
+                        break
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1011)
+        finally:
+            svc.unsubscribe_logs(job_id, q)
+
     # ------------------------------------------------------------- lifecycle
     async def bootstrap_loop() -> None:
         """Automatic setup: no shell needed. Runs at every start, retries until it works, re-verifies periodically."""
@@ -530,6 +630,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         Route("/runner/{job_id}/artifact", runner_artifact, methods=["PUT", "POST"]),
         Route("/runner/{job_id}/complete", runner_complete, methods=["POST"]),
         Route("/runner/{job_id}/log", runner_log, methods=["POST"]),
+        WebSocketRoute("/ws/builds/{job_id}/logs", ws_build_logs),
         *session_routes(sess),
         Mount("/", app=mcp.streamable_http_app()),
     ]

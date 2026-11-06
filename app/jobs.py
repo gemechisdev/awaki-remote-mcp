@@ -449,8 +449,27 @@ class BuildService:
             await asyncio.sleep(4)
 
     # ------------------------------------------------------------------- logs
+    def __init_log_hub(self) -> None:
+        if not hasattr(self, "_log_subs"):
+            self._log_subs: dict[str, list[asyncio.Queue]] = {}
+
+    def subscribe_logs(self, job_id: str) -> asyncio.Queue:
+        """Subscribe to live log chunks (for WebSocket). Caller must unsubscribe."""
+        self.__init_log_hub()
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._log_subs.setdefault(job_id, []).append(q)
+        return q
+
+    def unsubscribe_logs(self, job_id: str, q: asyncio.Queue) -> None:
+        self.__init_log_hub()
+        subs = self._log_subs.get(job_id) or []
+        if q in subs:
+            subs.remove(q)
+        if not subs:
+            self._log_subs.pop(job_id, None)
+
     def append_log(self, job_id: str, data: bytes) -> dict:
-        """Append a live log chunk from the runner. Creates the file if needed."""
+        """Append a live log chunk from the runner. Creates the file if needed. Notifies WS subscribers."""
         self.check_job_id(job_id)
         path = self.log_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,6 +482,13 @@ class BuildService:
             if to_write:
                 fh.write(to_write)
             size = path.stat().st_size
+        if to_write:
+            self.__init_log_hub()
+            for q in list(self._log_subs.get(job_id) or []):
+                try:
+                    q.put_nowait(to_write)
+                except asyncio.QueueFull:
+                    pass  # slow consumer; file still has the data
         return {"accepted": True, "size": size}
 
     async def read_output(self, job_id: str, offset: int = 0, max_chars: int = 30000,

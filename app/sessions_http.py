@@ -277,6 +277,48 @@ def register_session_tools(mcp, svc: SessionService, guard, public_url: str) -> 
         }
 
     @mcp.tool()
+    async def pull_from_session(session_id: str, paths: str, package: str = "named",
+                                cwd: str | None = None, wait_seconds: int = 120) -> dict:
+        """Copy any files from the live session workspace and return signed download urls.
+
+        Use this to fetch APKs/logs/outputs produced in the session without a separate build job.
+        paths: newline-separated globs (supports **). package='named' keeps each file separate.
+        Also works with download_artifact(session_id, name=…) afterward.
+        """
+        result = await guard(svc.collect(session_id, paths, package, None, cwd, wait_seconds))
+        items = svc.artifacts(svc.check_id(session_id))
+        for a in items:
+            a["url"] = base.rstrip("/") + a["download"]
+            a["curl"] = f"curl -sS -L -o '{a['name']}' '{a['url']}'"
+        return {
+            "collect": result,
+            "session_id": session_id,
+            "note": "Signed temporary URLs — no Authorization header required.",
+            "artifacts": items,
+        }
+
+    @mcp.tool()
+    async def download_session_artifact(session_id: str, name: str | None = None) -> dict:
+        """Signed download url for a session artifact (same as download_artifact for rs- ids)."""
+        sid = svc.check_id(session_id)
+        items = svc.artifacts(sid)
+        if not items:
+            raise ValueError("No session artifacts. Call pull_from_session or collect_artifacts first.")
+        if name:
+            items = [a for a in items if a["name"] == name]
+            if not items:
+                raise ValueError(f"Unknown artifact name {name!r}")
+        for a in items:
+            a["url"] = base.rstrip("/") + a["download"]
+            a["curl"] = f"curl -sS -L -o '{a['name']}' '{a['url']}'"
+        if len(items) == 1:
+            a = items[0]
+            return {"session_id": sid, "filename": a["name"], "size_bytes": a["size_bytes"],
+                    "url": a["url"], "curl": a["curl"],
+                    "note": "Signed temporary URL — no Authorization header required."}
+        return {"session_id": sid, "artifacts": items, "count": len(items)}
+
+    @mcp.tool()
     async def get_session_log(session_id: str, max_chars: int = 20000) -> dict:
         """Condensed transcript of recent commands (command, output tail, exit code)."""
         return await guard(_ret(svc.transcript(session_id, max_chars)))
